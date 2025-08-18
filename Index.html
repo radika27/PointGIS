@@ -1,0 +1,200 @@
+
+<!-- ========================================== -->
+<!-- HTML SECTION - STRUKTUR HALAMAN WEB -->
+<!-- ========================================== --><!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GeoAnalyzer – WebGIS Interaktif untuk Data Titik</title>
+    
+    <!-- External CSS Libraries -->
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div class="container">
+        <div class="main-content">
+            
+            <!-- Toggle Buttons -->
+            <button class="panel-toggle left-toggle" id="leftToggle">
+                <i class="fas fa-chevron-left"></i>
+            </button>
+            <button class="panel-toggle right-toggle" id="rightToggle">
+                <i class="fas fa-chevron-right"></i>
+            </button>
+
+            <!-- Panel Kiri -->
+            <div class="left-panel" id="leftPanel">
+                <div style="text-align: center; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid #e2e8f0;">
+                    <div style="display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 0.5rem;">
+                        <div style="width: 32px; height: 32px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 1.2rem;">
+                            🛰️
+                        </div>
+                       <h1 style="font-size: 1.5rem; font-weight: 700; 
+                                margin: 0;                /* hilangkan jarak luar */
+                                text-align:center; 
+                                line-height: 1.0;         /* rapat antar baris */
+                                background: linear-gradient(135deg, #2563eb 0%, #3b82f6 50%, #60a5fa 100%);
+                                background-clip: text; 
+                                -webkit-background-clip: text; 
+                                -webkit-text-fill-color: transparent; 
+                                color: transparent;">
+                            PointGIS 
+                            <br>
+                            <span style="font-size: 1rem; font-weight:500; letter-spacing:0.5px;
+                                        display:block;        /* pastikan baris baru */
+                                        margin:0;             /* buang jarak bawaan */
+                                        line-height:1.0;      /* rapat */
+                                        background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%);
+                                        background-clip: text;
+                                        -webkit-background-clip: text;
+                                        -webkit-text-fill-color: transparent;
+                                        color: transparent;">
+                                Analisis Spasial Data Titik
+
+    </span>
+</h1>
+
+                    </div>
+                    <div style="display: flex; align-items: center; justify-content: center; gap: 0.5rem; margin-bottom: 0.25rem;">
+                        <div style="width: 16px; height: 16px; background: #0077b5; border-radius: 2px; display: flex; align-items: center; justify-content: center; color: white; font-size: 0.6rem; font-weight: bold;">
+                            in
+                        </div>
+                        <p style="color: #718096; font-size: 0.7rem; margin: 0;">
+                            Created by <a href="https://www.linkedin.com/in/radhyka-galih-pranata-b78249209" target="_blank" style="color: #0077b5; text-decoration: none; font-weight: 500; transition: color 0.2s ease;" onmouseover="this.style.color='#005885'" onmouseout="this.style.color='#0077b5'">Radhyka Galih Pranata</a>
+                        </p>
+                    </div>
+                </div>
+                
+                <h2 class="panel-title">
+                    <i class="fas fa-upload"></i>
+                    Upload Data KML
+                </h2>
+                
+                <div class="success-message" id="successMessage">
+                    <i class="fas fa-check-circle"></i> File KML berhasil dimuat!
+                </div>
+                
+                <div class="error-message" id="errorMessage">
+                    <i class="fas fa-exclamation-circle"></i> <span id="errorText"></span>
+                </div>
+                
+                <div class="upload-area" id="uploadArea">
+                    <div class="upload-icon">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                    </div>
+                    <div class="upload-text">
+                        Klik atau drag & drop file KML, KMZ, atau Excel di sini
+                    </div>
+                    <input type="file" id="fileInput" class="file-input" accept=".kml,.kmz,.xlsx,.xls" />
+                </div>
+                
+                <div class="loading" id="loading">
+                    <div class="spinner"></div>
+                    Memproses file KML...
+                </div>
+                
+                <div class="attributes-section" id="attributesSection" style="display: none;">
+                    <h3 class="panel-title">
+                        <i class="fas fa-chart-bar"></i>
+                        Data Dashboard
+                    </h3>
+                    <div class="chart-container">
+                        <canvas id="attributeChart"></canvas>
+                    </div>
+                    <div id="dataList" class="data-list"></div>
+                    
+                    <h3 class="panel-title" style="margin-top: 1.5rem;">
+                        <i class="fas fa-list"></i>
+                        Atribut Pop-up
+                    </h3>
+                    <div id="attributesList"></div>
+                </div>
+            </div>
+
+            <!-- Peta -->
+            <div class="map-container">
+                <div id="map"></div>
+            </div>
+
+            <!-- Panel Kanan -->
+            <div class="right-panel" id="rightPanel">
+                <h2 class="panel-title">
+                    <i class="fas fa-chart-line"></i>
+                    Analisis Geospasial
+                </h2>
+                
+                <div class="analysis-section">
+                    <button class="analysis-btn" id="distanceBtn" disabled>
+                        <i class="fas fa-ruler"></i>
+                        Analisis Jarak
+                    </button>
+                    <button class="analysis-btn" id="bufferBtn" disabled>
+                        <i class="fas fa-circle"></i>
+                        Buffer Analysis
+                    </button>
+                    
+                    <!-- Buffer Controls -->
+                    <div id="bufferControls" style="display: none; margin: 1rem 0; padding: 1rem; background: #f7fafc; border-radius: 10px;">
+                        <label style="display: block; margin-bottom: 0.5rem; font-weight: 500; color: #2d3748;">
+                            Radius Buffer: <span id="radiusValue">1000</span> meter
+                        </label>
+                        <input type="range" id="radiusSlider" min="100" max="5000" value="1000" step="100" 
+                               style="width: 100%; margin-bottom: 1rem; accent-color: #667eea;">
+                        <button class="btn" id="applyBufferBtn" style="font-size: 0.9rem; padding: 0.5rem 1rem;">
+                            <i class="fas fa-play"></i>
+                            Terapkan Buffer
+                        </button>
+                    </div>
+                    
+                    <button class="analysis-btn" id="nearestBtn" disabled>
+                        <i class="fas fa-crosshairs"></i>
+                        Nearest Neighbor
+                    </button>
+                    
+                    <!-- Advanced Analysis -->
+                    <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #e2e8f0;">
+                        <h4 style="font-size: 0.9rem; color: #4a5568; margin-bottom: 0.5rem;">Analisis Lanjutan:</h4>
+                        <button class="analysis-btn" id="moranBtn" disabled style="font-size: 0.85rem; padding: 0.5rem;">
+                            <i class="fas fa-chart-area"></i>
+                            Moran's I Index
+                        </button>
+                        <button class="analysis-btn" id="ripleyBtn" disabled style="font-size: 0.85rem; padding: 0.5rem;">
+                            <i class="fas fa-bullseye"></i>
+                            Ripley's K-Function
+                        </button>
+                    </div>
+                    
+                    <button class="btn" id="refreshBtn" disabled style="background: #e53e3e; margin-top: 1rem;">
+                        <i class="fas fa-refresh"></i>
+                        Reset Analisis
+                    </button>
+                </div>
+                
+                <div class="results-container" id="resultsContainer" style="display: none;">
+                    <h4 style="margin-bottom: 1rem; color: #2d3748;">Hasil Analisis</h4>
+                    <div id="analysisResults"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- External JavaScript Libraries -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    
+    <!-- Custom JavaScript -->
+    <script src="main.js"></script>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9711a75114db4adc',t:'MTc1NTUyMjY1MC4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<!-- ========================================== -->
+<!-- END OF HTML DOCUMENT -->
+<!-- ========================================== -->
+</html>
