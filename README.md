@@ -29,5 +29,5 @@ Pengguna dapat mengunggah file **KML, KMZ, maupun Excel (XLS/XLSX)**, lalu siste
 ## 🚀 Cara Menjalankan
 1. Clone repository ini:  
    ```bash
-   git clone https://github.com/username/PointGIS.git
+   git clone [https://radika27.github.io/PointGIS/]
    cd PointGIS
