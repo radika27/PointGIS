@@ -31,3 +31,4 @@ Pengguna dapat mengunggah file **KML, KMZ, maupun Excel (XLS/XLSX)**, lalu siste
    ```bash
    git clone [https://radika27.github.io/PointGIS/]
    cd PointGIS
+2. Link Demo https://radika27.github.io/PointGIS/
