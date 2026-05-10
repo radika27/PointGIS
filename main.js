@@ -1,1404 +1,982 @@
-        // Inisialisasi peta
-        const map = L.map('map').setView([-3.530038200467506, 112.5464096700536], 5);
-        
-        // Base layers
-        const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            attribution: '© OpenStreetMap contributors'
+// ======================================================================
+// PointGIS v2.1 — Single-File Rebuild
+// Revisi kritis: proyeksi SDE, sanitasi XSS, progress bar, konsistensi
+// displayName, metodologi callout, koreksi variansi Moran edge case.
+// ======================================================================
+
+// ── Global state ────────────────────────────────────────────
+const map = L.map('map').setView([-3.53, 112.55], 5);
+
+// Custom panes
+map.createPane('analysisPane');
+map.getPane('analysisPane').style.zIndex = 350;
+map.getPane('analysisPane').style.pointerEvents = 'none';
+map.createPane('kdePane');
+map.getPane('kdePane').style.zIndex = 300;
+map.getPane('kdePane').style.pointerEvents = 'none';
+
+const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap contributors' });
+const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: '© Esri, Maxar, Earthstar Geographics' });
+const darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { attribution: '© CartoDB, © OpenStreetMap contributors' });
+darkLayer.addTo(map);
+L.control.layers({ '🗺️ OpenStreetMap': osmLayer, '🛰️ Satelit': satelliteLayer, '🌙 Dark Mode': darkLayer }, null, { position: 'topright', collapsed: false }).addTo(map);
+
+let currentLayer = null, currentData = [], selectedAttributes = new Set();
+let analysisMode = null, selectedPoints = [], distanceLines = [], bufferPoint = null;
+let attributeChart = null, analysisLayers = [], currentAnalysisResults = null;
+let kdeLegend = null, giLegend = null, kdeAnimFrame = null, kdeCanvas = null, kdeGridData = null;
+
+const KATEGORI_PALETTE = [
+    '#4f46e5', '#e11d48', '#059669', '#d97706', '#0891b2',
+    '#7c3aed', '#dc2626', '#16a34a', '#b45309', '#0284c7',
+    '#9333ea', '#f97316'
+];
+
+let kategoriState = {
+    active: false,
+    kolom: null,
+    colorMap: {},
+    hiddenCats: new Set(),
+    markerMap: []
+};
+
+// ── Sanitasi HTML ───────────────────────────────────────────
+function escapeHTML(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+// ── Nama terbaik dari atribut ────────────────────────────────
+function getBestName(attrs, fallback) {
+    const exact = Object.keys(attrs).find(k => /^(name|nama|title|judul|label)$/i.test(k));
+    if (exact && attrs[exact]) return attrs[exact];
+    const partial = Object.keys(attrs).find(k => /name|nama|title|judul/i.test(k));
+    if (partial && attrs[partial]) return attrs[partial];
+    return fallback;
+}
+
+// ── Data aktif: hanya titik yang tidak di-hide ───────────────
+function getActiveData() {
+    if (!kategoriState.active || !kategoriState.kolom) return currentData;
+    return currentData.filter(p => !kategoriState.hiddenCats.has(p.attributes[kategoriState.kolom]));
+}
+
+// ── Panel toggle ─────────────────────────────────────────────
+document.getElementById('leftToggle').addEventListener('click', () => {
+    const p = document.getElementById('leftPanel'), b = document.getElementById('leftToggle'), i = b.querySelector('i');
+    const h = p.classList.toggle('panel-hidden'); b.classList.toggle('at-edge', h);
+    i.className = h ? 'fas fa-chevron-right' : 'fas fa-chevron-left';
+    setTimeout(() => map.invalidateSize(), 300);
+});
+document.getElementById('rightToggle').addEventListener('click', () => {
+    const p = document.getElementById('rightPanel'), b = document.getElementById('rightToggle'), i = b.querySelector('i');
+    const h = p.classList.toggle('panel-hidden'); b.classList.toggle('at-edge', h);
+    i.className = h ? 'fas fa-chevron-left' : 'fas fa-chevron-right';
+    setTimeout(() => map.invalidateSize(), 300);
+});
+
+// ── Event delegation tombol analisis ─────────────────────────
+document.getElementById('distanceBtn').addEventListener('click', () => toggleAnalysisMode('distance'));
+document.getElementById('bufferBtn').addEventListener('click', () => toggleAnalysisMode('buffer'));
+document.getElementById('nearestBtn').addEventListener('click', () => toggleAnalysisMode('nearest'));
+document.getElementById('moranBtn').addEventListener('click', () => toggleAnalysisMode('moran'));
+document.getElementById('applyMoranBtn').addEventListener('click', performMoranAnalysis);
+document.getElementById('sdeBtn').addEventListener('click', () => toggleAnalysisMode('sde'));
+document.getElementById('voronoiBtn').addEventListener('click', () => toggleAnalysisMode('voronoi'));
+document.getElementById('ripleyBtn').addEventListener('click', performRipleyAnalysis);
+document.getElementById('kdeBtn').addEventListener('click', () => toggleAnalysisMode('kde'));
+document.getElementById('giBtn').addEventListener('click', () => toggleAnalysisMode('gi'));
+document.getElementById('refreshBtn').addEventListener('click', refreshAnalysis);
+document.getElementById('radiusSlider').addEventListener('input', e => document.getElementById('radiusValue').textContent = e.target.value);
+document.getElementById('applyBufferBtn').addEventListener('click', applyBuffer);
+document.getElementById('kdeBandwidthSlider').addEventListener('input', e => document.getElementById('kdeBandwidthValue').textContent = e.target.value);
+document.getElementById('kdeResSlider').addEventListener('input', e => document.getElementById('kdeResValue').textContent = e.target.value);
+document.getElementById('kdeAnimSlider').addEventListener('input', e => document.getElementById('kdeAnimLabel').textContent = e.target.value === '1' ? 'Aktif' : 'Nonaktif');
+document.getElementById('applyKdeBtn').addEventListener('click', performKDEAnalysis);
+document.getElementById('giThreshSlider').addEventListener('input', e => document.getElementById('giThreshValue').textContent = e.target.value);
+document.getElementById('applyGiBtn').addEventListener('click', performGiStarAnalysis);
+document.getElementById('undoDistanceBtn').addEventListener('click', undoLastDistancePoint);
+document.getElementById('finishDistanceBtn').addEventListener('click', finalizeDistancePath);
+document.getElementById('exportResultsBtn').addEventListener('click', exportAnalysisResults);
+document.getElementById('closeBottomPanel').addEventListener('click', () => document.getElementById('bottomPanel').classList.add('panel-hidden'));
+document.getElementById('applyKategoriBtn').addEventListener('click', applyKategorisasi);
+document.getElementById('resetKategoriBtn').addEventListener('click', resetKategorisasi);
+
+// ── Upload ───────────────────────────────────────────────────
+document.getElementById('uploadArea').addEventListener('click', () => document.getElementById('fileInput').click());
+document.getElementById('fileInput').addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+const uploadArea = document.getElementById('uploadArea');
+uploadArea.addEventListener('dragover', e => { e.preventDefault(); uploadArea.classList.add('dragover'); });
+uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('dragover'));
+uploadArea.addEventListener('drop', e => { e.preventDefault(); uploadArea.classList.remove('dragover'); if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]); });
+
+// ── Progress bar helpers ─────────────────────────────────────
+function setProgress(wrapId, fillId, percent) {
+    const w = document.getElementById(wrapId), f = document.getElementById(fillId);
+    if (w) w.style.display = percent > 0 ? 'block' : 'none';
+    if (f) f.style.width = percent + '%';
+}
+
+// ── Toggle analysis mode ─────────────────────────────────────
+function toggleAnalysisMode(mode) {
+    document.querySelectorAll('.analysis-btn').forEach(b => b.classList.remove('active'));
+    ['bufferControls', 'kdeControls', 'giControls', 'moranControls', 'distanceControls'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+    });
+    if (analysisMode === mode) {
+        analysisMode = null; bufferPoint = null;
+        clearDistanceLines(); clearAnalysisResults(); return;
+    }
+    analysisMode = mode;
+    document.getElementById(mode + 'Btn').classList.add('active');
+    clearDistanceLines(); bufferPoint = null;
+    if (mode === 'buffer') document.getElementById('bufferControls').style.display = 'block';
+    else if (mode === 'kde') document.getElementById('kdeControls').style.display = 'block';
+    else if (mode === 'gi') { document.getElementById('giControls').style.display = 'block'; populateGiAttrSelect(); }
+    else if (mode === 'moran') { document.getElementById('moranControls').style.display = 'block'; populateMoranAttrSelect(); }
+    else if (mode === 'distance') { document.getElementById('distanceControls').style.display = 'block'; updateDistanceStatus(); }
+    else if (mode === 'nearest') performNearestNeighborAnalysis();
+    else if (mode === 'sde') performSDEAnalysis();
+    else if (mode === 'voronoi') performVoronoiAnalysis();
+}
+
+// ── Analisis Jarak multi-titik ──────────────────────────────
+function addDistancePoint(marker, pointData) {
+    selectedPoints.push({ marker, pointData });
+    marker.setStyle({ fillColor: '#dc2626', color: '#b91c1c' });
+    if (selectedPoints.length >= 2) {
+        const prev = selectedPoints[selectedPoints.length - 2].pointData;
+        const curr = pointData;
+        const line = L.polyline([[prev.lat, prev.lng], [curr.lat, curr.lng]], { color: '#dc2626', weight: 2, dashArray: '6 4' }).addTo(map);
+        distanceLines.push(line);
+    }
+    updateDistanceStatus();
+}
+function undoLastDistancePoint() {
+    if (!selectedPoints.length) return;
+    selectedPoints[selectedPoints.length - 1].marker.setStyle({ fillColor: '#4f46e5', color: '#3730a3' });
+    selectedPoints.pop();
+    if (distanceLines.length) { const l = distanceLines.pop(); if (map.hasLayer(l)) map.removeLayer(l); }
+    updateDistanceStatus();
+}
+function updateDistanceStatus() {
+    const n = selectedPoints.length;
+    const s = document.getElementById('distanceStatus');
+    if (s) s.textContent = n === 0 ? 'Klik titik-titik di peta untuk membuat jalur' : n === 1 ? '1 titik dipilih — pilih minimal 1 lagi' : `${n} titik terpilih`;
+    const fb = document.getElementById('finishDistanceBtn'), ub = document.getElementById('undoDistanceBtn');
+    if (fb) fb.disabled = n < 2;
+    if (ub) ub.disabled = n < 1;
+}
+function finalizeDistancePath() {
+    if (selectedPoints.length < 2) return;
+    let totalDist = 0;
+    const segments = [];
+    for (let i = 0; i < selectedPoints.length - 1; i++) {
+        const p1 = selectedPoints[i].pointData, p2 = selectedPoints[i + 1].pointData;
+        const d = map.distance([p1.lat, p1.lng], [p2.lat, p2.lng]);
+        totalDist += d;
+        segments.push({ from: p1.displayName, to: p2.displayName, dist: d });
+    }
+    distanceLines.forEach(l => analysisLayers.push(l)); distanceLines = [];
+    selectedPoints.forEach(p => p.marker.setStyle({ fillColor: '#4f46e5', color: '#3730a3' })); selectedPoints = [];
+    analysisMode = null;
+    document.getElementById('distanceBtn').classList.remove('active');
+    document.getElementById('distanceControls').style.display = 'none';
+    currentAnalysisResults = { type: 'distance', total: totalDist / 1000, segments: segments.length };
+    showAnalysisResults('distance', currentAnalysisResults);
+}
+function clearDistanceLines() {
+    distanceLines.forEach(l => { if (map.hasLayer(l)) map.removeLayer(l); }); distanceLines = [];
+    selectedPoints.forEach(p => { try { p.marker.setStyle({ fillColor: '#4f46e5', color: '#3730a3' }); } catch { } }); selectedPoints = [];
+    const s = document.getElementById('distanceStatus'); if (s) s.textContent = 'Klik titik-titik di peta untuk membuat jalur';
+    const fb = document.getElementById('finishDistanceBtn'), ub = document.getElementById('undoDistanceBtn');
+    if (fb) fb.disabled = true; if (ub) ub.disabled = true;
+}
+
+// ── Buffer ──────────────────────────────────────────────────
+function selectBufferPoint(marker, pointData) {
+    if (bufferPoint?.marker) bufferPoint.marker.setStyle({ fillColor: '#4f46e5', color: '#3730a3' });
+    bufferPoint = { marker, pointData };
+    marker.setStyle({ fillColor: '#059669', color: '#047857' });
+}
+function applyBuffer() {
+    if (!bufferPoint) { showError('Klik titik di peta untuk memilih center buffer!'); return; }
+    const radius = parseInt(document.getElementById('radiusSlider').value);
+    analysisLayers = analysisLayers.filter(l => { if (l._isBuffer) { if (map.hasLayer(l)) map.removeLayer(l); return false; } return true; });
+    const circle = L.circle([bufferPoint.pointData.lat, bufferPoint.pointData.lng], {
+        radius, fillColor: '#059669', color: '#047857', weight: 2, opacity: 0.8, fillOpacity: 0.15,
+        pane: 'analysisPane'
+    }).addTo(map);
+    circle._isBuffer = true; analysisLayers.push(circle);
+    const active = getActiveData();
+    const pts = active.filter(p => { const d = map.distance([bufferPoint.pointData.lat, bufferPoint.pointData.lng], [p.lat, p.lng]); return d <= radius && d > 0; });
+    currentAnalysisResults = { type: 'buffer', radius, count: pts.length };
+    showAnalysisResults('buffer', currentAnalysisResults);
+}
+
+// ── Nearest Neighbor (Clark & Evans 1954) ───────────────────
+function performNearestNeighborAnalysis() {
+    const active = getActiveData();
+    if (active.length < 2) { showError('Minimal 2 titik aktif untuk Nearest Neighbor'); return; }
+
+    analysisLayers.forEach(l => { try { if (l && l.remove) l.remove(); else if (map.hasLayer(l)) map.removeLayer(l); } catch (e) { } }); analysisLayers = [];
+
+    let total = 0;
+    active.forEach((pt, i) => {
+        let nearD = Infinity;
+        let nearPt = null;
+        active.forEach((op, j) => {
+            if (i === j) return;
+            const d = map.distance([pt.lat, pt.lng], [op.lat, op.lng]);
+            if (d < nearD) { nearD = d; nearPt = op; }
         });
-        
-        const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-            attribution: '© Esri, Maxar, Earthstar Geographics'
-        });
-        
-        const darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-            attribution: '© CartoDB, © OpenStreetMap contributors'
-        });
-        
-        // Add default layer
-        satelliteLayer.addTo(map);
-        
-        // Layer control
-        const baseLayers = {
-            "🗺️ OpenStreetMap": osmLayer,
-            "🛰️ Satelit": satelliteLayer,
-            "🌙 Dark Mode": darkLayer
-        };
-        
-        const layerControl = L.control.layers(baseLayers, null, {
-            position: 'topright',
-            collapsed: false
-        }).addTo(map);
 
-        // Variabel global
-        let currentLayer = null;
-        let currentData = [];
-        let selectedAttributes = new Set();
-        let analysisMode = null;
-        let selectedPoints = [];
-        let attributeChart = null;
-        let analysisLayers = [];
-        let currentAnalysisResults = null;
-        let bufferPoint = null;
-
-        // Event listeners
-        document.getElementById('uploadArea').addEventListener('click', () => {
-            document.getElementById('fileInput').click();
-        });
-
-        document.getElementById('fileInput').addEventListener('change', handleFileUpload);
-
-        // Panel toggle functionality
-        document.getElementById('leftToggle').addEventListener('click', toggleLeftPanel);
-        document.getElementById('rightToggle').addEventListener('click', toggleRightPanel);
-
-
-        // Drag & drop functionality
-        const uploadArea = document.getElementById('uploadArea');
-        
-        uploadArea.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            uploadArea.classList.add('dragover');
-        });
-
-        uploadArea.addEventListener('dragleave', () => {
-            uploadArea.classList.remove('dragover');
-        });
-
-        uploadArea.addEventListener('drop', (e) => {
-            e.preventDefault();
-            uploadArea.classList.remove('dragover');
-            const files = e.dataTransfer.files;
-            if (files.length > 0) {
-                handleFile(files[0]);
-            }
-        });
-
-        // Analysis buttons
-        document.getElementById('distanceBtn').addEventListener('click', () => toggleAnalysisMode('distance'));
-        document.getElementById('bufferBtn').addEventListener('click', () => toggleAnalysisMode('buffer'));
-        document.getElementById('nearestBtn').addEventListener('click', () => toggleAnalysisMode('nearest'));
-        document.getElementById('moranBtn').addEventListener('click', () => performMoranAnalysis());
-        document.getElementById('ripleyBtn').addEventListener('click', () => performRipleyAnalysis());
-        document.getElementById('refreshBtn').addEventListener('click', refreshAnalysis);
-        
-        // Buffer controls
-        document.getElementById('radiusSlider').addEventListener('input', (e) => {
-            document.getElementById('radiusValue').textContent = e.target.value;
-        });
-        document.getElementById('applyBufferBtn').addEventListener('click', applyBuffer);
-        
-
-
-        function handleFileUpload(event) {
-            const file = event.target.files[0];
-            if (file) {
-                handleFile(file);
-            }
-        }
-
-        function handleFile(file) {
-            const fileName = file.name.toLowerCase();
-            
-            if (!fileName.endsWith('.kml') && !fileName.endsWith('.kmz') && 
-                !fileName.endsWith('.xlsx') && !fileName.endsWith('.xls')) {
-                showError('File harus berformat KML, KMZ, atau Excel (.xlsx/.xls)');
-                return;
-            }
-
-            showLoading(true);
-            
-            if (fileName.endsWith('.kmz')) {
-                handleKMZ(file);
-            } else if (fileName.endsWith('.xlsx') || fileName.endsWith('.xls')) {
-                handleExcel(file);
-            } else {
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    try {
-                        parseKML(e.target.result);
-                    } catch (error) {
-                        showError('Error parsing KML file: ' + error.message);
-                        showLoading(false);
-                    }
-                };
-                reader.readAsText(file);
-            }
-        }
-
-        function handleKMZ(file) {
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                JSZip.loadAsync(e.target.result).then(function(zip) {
-                    // Find KML file in the zip
-                    let kmlFile = null;
-                    Object.keys(zip.files).forEach(filename => {
-                        if (filename.toLowerCase().endsWith('.kml')) {
-                            kmlFile = zip.files[filename];
-                        }
-                    });
-                    
-                    if (kmlFile) {
-                        kmlFile.async('text').then(function(kmlText) {
-                            try {
-                                parseKML(kmlText, zip);
-                            } catch (error) {
-                                showError('Error parsing KMZ file: ' + error.message);
-                                showLoading(false);
-                            }
-                        });
-                    } else {
-                        showError('Tidak ada file KML ditemukan dalam KMZ');
-                        showLoading(false);
-                    }
-                }).catch(function(error) {
-                    showError('Error reading KMZ file: ' + error.message);
-                    showLoading(false);
-                });
-            };
-            reader.readAsArrayBuffer(file);
-        }
-
-        function handleExcel(file) {
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                try {
-                    const workbook = XLSX.read(e.target.result, {type: 'array'});
-                    const sheetName = workbook.SheetNames[0];
-                    const worksheet = workbook.Sheets[sheetName];
-                    const data = XLSX.utils.sheet_to_json(worksheet);
-                    
-                    parseExcelData(data);
-                } catch (error) {
-                    showError('Error parsing Excel file: ' + error.message);
-                    showLoading(false);
-                }
-            };
-            reader.readAsArrayBuffer(file);
-        }
-
-        function parseExcelData(data) {
-            if (data.length === 0) {
-                showError('File Excel kosong');
-                showLoading(false);
-                return;
-            }
-
-            currentData = [];
-            const allAttributes = new Set();
-
-            // Clear existing layer
-            if (currentLayer) {
-                map.removeLayer(currentLayer);
-            }
-
-            currentLayer = L.layerGroup().addTo(map);
-
-            // Find lat/lng columns
-            const firstRow = data[0];
-            const columns = Object.keys(firstRow);
-            
-            let latCol = null;
-            let lngCol = null;
-            
-            // Try to find latitude and longitude columns
-            columns.forEach(col => {
-                const colLower = col.toLowerCase();
-                if (colLower.includes('lat') || colLower.includes('y')) {
-                    latCol = col;
-                }
-                if (colLower.includes('lng') || colLower.includes('lon') || colLower.includes('x')) {
-                    lngCol = col;
-                }
-            });
-
-            if (!latCol || !lngCol) {
-                showError('Kolom latitude dan longitude tidak ditemukan. Pastikan ada kolom yang mengandung "lat" dan "lng"');
-                showLoading(false);
-                return;
-            }
-
-            data.forEach((row, index) => {
-                const lat = parseFloat(row[latCol]);
-                const lng = parseFloat(row[lngCol]);
-                
-                if (!isNaN(lat) && !isNaN(lng)) {
-                    const attributes = {};
-                    
-                    // Add all columns as attributes
-                    Object.keys(row).forEach(key => {
-                        if (row[key] !== null && row[key] !== undefined && row[key] !== '') {
-                            attributes[key] = row[key].toString();
-                            allAttributes.add(key);
-                        }
-                    });
-
-                    const pointData = {
-                        lat: lat,
-                        lng: lng,
-                        attributes: attributes
-                    };
-
-                    currentData.push(pointData);
-
-                    // Create marker
-                    const marker = L.circleMarker([lat, lng], {
-                        radius: 8,
-                        fillColor: '#667eea',
-                        color: '#4c51bf',
-                        weight: 2,
-                        opacity: 1,
-                        fillOpacity: 0.8
-                    });
-
-                    // Add label
-                    const Name = attributes.Name || attributes.name || attributes.NAMA || `Titik ${index + 1}`;
-                    const label = L.divIcon({
-                        className: 'point-label',
-                        html: Name,
-                        iconSize: [null, null],
-                        iconAnchor: [null, -15]
-                    });
-                    
-                    const labelMarker = L.marker([lat, lng], {icon: label}).addTo(currentLayer);
-
-                    marker.on('click', () => handleMarkerClick(marker, pointData));
-                    currentLayer.addLayer(marker);
-                }
-            });
-
-            if (currentData.length > 0) {
-                // Fit map to bounds
-                const group = new L.featureGroup(currentLayer.getLayers());
-                map.fitBounds(group.getBounds().pad(0.1));
-
-                // Setup attributes
-                setupAttributes(Array.from(allAttributes));
-                
-                // Create dashboard chart
-                createDashboardChart();
-                
-                // Enable analysis buttons
-                enableAnalysisButtons();
-                
-                showSuccess('File Excel berhasil dimuat! ' + currentData.length + ' titik ditampilkan.');
-            } else {
-                showError('Tidak ada titik valid ditemukan dalam file Excel');
-            }
-
-            showLoading(false);
-        }
-
-        function parseKML(kmlText, zipFile = null) {
-            const parser = new DOMParser();
-            const kmlDoc = parser.parseFromString(kmlText, 'text/xml');
-            
-            const placemarks = kmlDoc.getElementsByTagName('Placemark');
-            
-            if (placemarks.length === 0) {
-                showError('Tidak ada data titik ditemukan dalam file KML');
-                showLoading(false);
-                return;
-            }
-
-            currentData = [];
-            const allAttributes = new Set();
-
-            // Clear existing layer
-            if (currentLayer) {
-                map.removeLayer(currentLayer);
-            }
-
-            currentLayer = L.layerGroup().addTo(map);
-
-            for (let i = 0; i < placemarks.length; i++) {
-                const placemark = placemarks[i];
-                const coordinates = placemark.getElementsByTagName('coordinates')[0];
-                
-                if (coordinates) {
-                    const coordText = coordinates.textContent.trim();
-                    const [lng, lat] = coordText.split(',').map(Number);
-                    
-                    if (!isNaN(lat) && !isNaN(lng)) {
-                        // Extract attributes
-                        const attributes = {};
-                        const name = placemark.getElementsByTagName('name')[0];
-                        const description = placemark.getElementsByTagName('description')[0];
-                        
-                        if (name) {
-                            attributes['Name'] = name.textContent;
-                            allAttributes.add('Name');
-                        }
-                        
-                        if (description) {
-                            attributes['Description'] = description.textContent;
-                            allAttributes.add('Description');
-                        }
-
-                        // Extract extended data
-                        const extendedData = placemark.getElementsByTagName('ExtendedData')[0];
-                        if (extendedData) {
-                            const simpleData = extendedData.getElementsByTagName('SimpleData');
-                            for (let j = 0; j < simpleData.length; j++) {
-                                const data = simpleData[j];
-                                const attrName = data.getAttribute('name');
-                                const attrValue = data.textContent;
-                                attributes[attrName] = attrValue;
-                                allAttributes.add(attrName);
-                            }
-                        }
-
-                        const pointData = {
-                            lat: lat,
-                            lng: lng,
-                            attributes: attributes
-                        };
-
-                        currentData.push(pointData);
-
-                        // Create marker
-                        const marker = L.circleMarker([lat, lng], {
-                            radius: 8,
-                            fillColor: '#667eea',
-                            color: '#4c51bf',
-                            weight: 2,
-                            opacity: 1,
-                            fillOpacity: 0.8
-                        });
-
-                        // Add label
-                        const Name = attributes.Name || attributes.name || `Titik ${i + 1}`;
-                        const label = L.divIcon({
-                            className: 'point-label',
-                            html: Name,
-                            iconSize: [null, null],
-                            iconAnchor: [null, -15]
-                        });
-                        
-                        const labelMarker = L.marker([lat, lng], {icon: label}).addTo(currentLayer);
-
-                        marker.on('click', () => handleMarkerClick(marker, pointData, zipFile));
-                        currentLayer.addLayer(marker);
-                    }
-                }
-            }
-
-            if (currentData.length > 0) {
-                // Fit map to bounds
-                const group = new L.featureGroup(currentLayer.getLayers());
-                map.fitBounds(group.getBounds().pad(0.1));
-
-                // Setup attributes
-                setupAttributes(Array.from(allAttributes));
-                
-                // Create dashboard chart
-                createDashboardChart();
-                
-                // Enable analysis buttons
-                enableAnalysisButtons();
-                
-                showSuccess('File KML berhasil dimuat! ' + currentData.length + ' titik ditampilkan.');
-            } else {
-                showError('Tidak ada titik valid ditemukan dalam file KML');
-            }
-
-            showLoading(false);
-        }
-
-        function classifyANN(zScore, Rratio = null) {
-            let kelas;
-
-            if (zScore <= -2.58) { kelas = "Sangat Terklaster"; }
-            else if (zScore <= -1.96) { kelas = "Terklaster"; }
-            else if (zScore <= -1.65) { kelas = "Terklaster (lemah)"; }
-            else if (zScore < 1.65) { kelas = "Acak (tidak signifikan)"; }
-            else if (zScore < 1.96) { kelas = "Tersebar (lemah)"; }
-            else if (zScore < 2.58) { kelas = "Tersebar"; }
-            else { kelas = "Sangat Tersebar"; }
-
-            return kelas;
-        }
-
-        function setupAttributes(attributes) {
-            const attributesList = document.getElementById('attributesList');
-            attributesList.innerHTML = '';
-            
-            selectedAttributes.clear();
-            
-            attributes.forEach(attr => {
-                const item = document.createElement('div');
-                item.className = 'attribute-item';
-                
-                const checkbox = document.createElement('input');
-                checkbox.type = 'checkbox';
-                checkbox.className = 'attribute-checkbox';
-                checkbox.id = 'attr_' + attr;
-                checkbox.checked = true;
-                selectedAttributes.add(attr);
-                
-                checkbox.addEventListener('change', (e) => {
-                    if (e.target.checked) {
-                        selectedAttributes.add(attr);
-                    } else {
-                        selectedAttributes.delete(attr);
-                    }
-                });
-                
-                const label = document.createElement('label');
-                label.htmlFor = 'attr_' + attr;
-                label.textContent = attr;
-                label.style.cursor = 'pointer';
-                
-                item.appendChild(checkbox);
-                item.appendChild(label);
-                attributesList.appendChild(item);
-            });
-            
-            document.getElementById('attributesSection').style.display = 'block';
-        }
-
-        function handleMarkerClick(marker, pointData, zipFile = null) {
-            if (analysisMode === 'distance' || analysisMode === 'buffer') {
-                handleAnalysisClick(marker, pointData);
-                return;
-            }
-
-            // Generate unique ID for this popup
-            const popupId = 'popup_' + Date.now();
-            
-            // Get available name attributes
-            const nameAttributes = Object.keys(pointData.attributes).filter(attr => 
-                attr.toLowerCase().includes('name') || 
-                attr.toLowerCase().includes('nama') || 
-                attr.toLowerCase().includes('title') || 
-                attr.toLowerCase().includes('judul') ||
-                attr.toLowerCase().includes('label')
-            );
-            
-            // If no name attributes found, use all attributes as options
-            const displayOptions = nameAttributes.length > 0 ? nameAttributes : Object.keys(pointData.attributes);
-            
-            // Get current display name
-            let currentDisplayName = pointData.attributes.Name || 
-                                   pointData.attributes.name || 
-                                   pointData.attributes.NAMA || 
-                                   displayOptions[0] ? pointData.attributes[displayOptions[0]] : 'Titik';
-
-            // Regular popup
-            let popupContent = '<div class="popup-content">';
-            
-            // Header with name selector
-            popupContent += '<div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.5rem;">';
-            popupContent += '<div style="flex: 1;">';
-            popupContent += '<h4 style="margin: 0 0 0.5rem 0; color: #2d3748; font-size: 1rem;">Detail Informasi</h4>';
-            
-            // Name selector dropdown
-            if (displayOptions.length > 1) {
-                popupContent += '<div style="margin-bottom: 0.5rem;">';
-                popupContent += '<label style="font-size: 0.8rem; color: #4a5568; display: block; margin-bottom: 0.25rem;">Tampilkan sebagai:</label>';
-                popupContent += `<select id="${popupId}_nameSelector" onchange="updatePopupTitle('${popupId}')" style="width: 100%; padding: 0.25rem 0.5rem; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 0.85rem; background: white;">`;
-                
-                displayOptions.forEach(attr => {
-                    const selected = (pointData.attributes[attr] === currentDisplayName) ? 'selected' : '';
-                    popupContent += `<option value="${attr}" ${selected}>${attr}: ${pointData.attributes[attr]}</option>`;
-                });
-                
-                popupContent += '</select>';
-                popupContent += '</div>';
-            }
-            
-            // Display current name
-            popupContent += `<div id="${popupId}_displayName" style="font-weight: 600; color: #667eea; font-size: 1.1rem; padding: 0.5rem; background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%); border-radius: 8px; border-left: 3px solid #667eea;">${currentDisplayName}</div>`;
-            popupContent += '</div>';
-            
-            popupContent += '<button onclick="closeCurrentPopup()" style="background: none; border: none; color: #718096; cursor: pointer; font-size: 1.4rem; padding: 0; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; border-radius: 50%; transition: all 0.2s ease; flex-shrink: 0;" onmouseover="this.style.background=\'#f7fafc\'; this.style.color=\'#e53e3e\'" onmouseout="this.style.background=\'none\'; this.style.color=\'#718096\'">×</button>';
-            popupContent += '</div>';
-            popupContent += '</div>';
-            
-            // Coordinates info
-            popupContent += '<div style="margin-bottom: 0.75rem; padding: 0.5rem; background: #f7fafc; border-radius: 6px; font-size: 0.85rem;">';
-            popupContent += '<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">';
-            popupContent += `<div><span style="color: #4a5568; font-weight: 500;">Latitude:</span><br><span style="color: #2d3748;">${pointData.lat.toFixed(6)}</span></div>`;
-            popupContent += `<div><span style="color: #4a5568; font-weight: 500;">Longitude:</span><br><span style="color: #2d3748;">${pointData.lng.toFixed(6)}</span></div>`;
-            popupContent += '</div>';
-            popupContent += '</div>';
-            
-            // Attributes section
-            popupContent += '<div style="max-height: 300px; overflow-y: auto;">';
-            popupContent += '<h5 style="margin-bottom: 0.5rem; color: #2d3748; font-size: 0.9rem; display: flex; align-items: center; gap: 0.5rem;"><i class="fas fa-list" style="color: #667eea;"></i>Atribut Data</h5>';
-            
-            selectedAttributes.forEach(attr => {
-                if (pointData.attributes[attr]) {
-                    const value = pointData.attributes[attr];
-                    
-                    // Check if it's an image reference
-                    if (zipFile && (value.toLowerCase().includes('.jpg') || 
-                                   value.toLowerCase().includes('.jpeg') || 
-                                   value.toLowerCase().includes('.png') || 
-                                   value.toLowerCase().includes('.gif'))) {
-                        
-                        // Try to find the image in the zip file
-                        const imageFile = zipFile.files[value] || zipFile.files['files/' + value];
-                        if (imageFile) {
-                            imageFile.async('base64').then(function(base64) {
-                                const imgElement = document.querySelector(`#img-${attr.replace(/\s+/g, '')}`);
-                                if (imgElement) {
-                                    imgElement.src = `data:image/jpeg;base64,${base64}`;
-                                    imgElement.style.display = 'block';
-                                }
-                            });
-                            
-                            popupContent += `
-                                <div class="popup-attribute" style="margin-bottom: 0.75rem; padding: 0.5rem; background: white; border-radius: 6px; border-left: 3px solid #667eea;">
-                                    <span class="popup-label" style="font-weight: 500; color: #4a5568; font-size: 0.85rem;">${attr}:</span><br>
-                                    <img id="img-${attr.replace(/\s+/g, '')}" style="max-width: 200px; max-height: 150px; display: none; margin-top: 5px; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);" />
-                                </div>
-                            `;
-                        } else {
-                            popupContent += `
-                                <div class="popup-attribute" style="margin-bottom: 0.5rem; padding: 0.5rem; background: white; border-radius: 6px; border-left: 3px solid #667eea;">
-                                    <span class="popup-label" style="font-weight: 500; color: #4a5568; font-size: 0.85rem;">${attr}:</span>
-                                    <div class="popup-value" style="color: #2d3748; margin-top: 0.25rem; font-size: 0.9rem;">${value}</div>
-                                </div>
-                            `;
-                        }
-                    } else {
-                        // Check if value is a URL
-                        const isUrl = value.toString().match(/^https?:\/\/.+/);
-                        
-                        popupContent += `
-                            <div class="popup-attribute" style="margin-bottom: 0.5rem; padding: 0.5rem; background: white; border-radius: 6px; border-left: 3px solid #667eea;">
-                                <span class="popup-label" style="font-weight: 500; color: #4a5568; font-size: 0.85rem;">${attr}:</span>
-                                <div class="popup-value" style="color: #2d3748; margin-top: 0.25rem; font-size: 0.9rem; word-break: break-word;">
-                                    ${isUrl ? `<a href="${value}" target="_blank" style="color: #667eea; text-decoration: none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${value} <i class="fas fa-external-link-alt" style="font-size: 0.7rem;"></i></a>` : value}
-                                </div>
-                            </div>
-                        `;
-                    }
-                }
-            });
-            
-            popupContent += '</div>';
-            
-            // Action buttons
-            popupContent += '<div style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid #e2e8f0; display: flex; gap: 0.5rem;">';
-            popupContent += `<button onclick="zoomToPoint({lat: ${pointData.lat}, lng: ${pointData.lng}, attributes: ${JSON.stringify(pointData.attributes).replace(/"/g, '&quot;')}})" style="flex: 1; background: #667eea; color: white; border: none; padding: 0.5rem; border-radius: 6px; font-size: 0.8rem; cursor: pointer; transition: all 0.2s ease;" onmouseover="this.style.background='#5a67d8'" onmouseout="this.style.background='#667eea'"><i class="fas fa-crosshairs"></i> Zoom</button>`;
-            popupContent += `<button onclick="copyCoordinates(${pointData.lat}, ${pointData.lng})" style="flex: 1; background: #38a169; color: white; border: none; padding: 0.5rem; border-radius: 6px; font-size: 0.8rem; cursor: pointer; transition: all 0.2s ease;" onmouseover="this.style.background='#2f855a'" onmouseout="this.style.background='#38a169'"><i class="fas fa-copy"></i> Copy</button>`;
-            popupContent += '</div>';
-            
-            popupContent += '</div>';
-            
-            // Store popup data for name selector
-            window.popupData = window.popupData || {};
-            window.popupData[popupId] = pointData;
-            
-            const popup = L.popup({
-                maxWidth: 380,
-                className: 'custom-popup',
-                closeButton: false,
-                autoClose: true,
-                closeOnClick: true,
-                closeOnEscapeKey: true
-            }).setContent(popupContent);
-            
-            marker.bindPopup(popup).openPopup();
-        }
-
-        // Global function to close popup
-        window.closeCurrentPopup = function() {
-            map.closePopup();
-        };
-
-        // Global function to update popup title based on selected attribute
-        window.updatePopupTitle = function(popupId) {
-            const selector = document.getElementById(popupId + '_nameSelector');
-            const displayElement = document.getElementById(popupId + '_displayName');
-            const pointData = window.popupData[popupId];
-            
-            if (selector && displayElement && pointData) {
-                const selectedAttr = selector.value;
-                const newDisplayName = pointData.attributes[selectedAttr] || 'Titik';
-                displayElement.textContent = newDisplayName;
-                
-                // Add animation effect
-                displayElement.style.transform = 'scale(1.05)';
-                displayElement.style.transition = 'transform 0.2s ease';
-                setTimeout(() => {
-                    displayElement.style.transform = 'scale(1)';
-                }, 200);
-            }
-        };
-
-        // Global function to copy coordinates
-        window.copyCoordinates = function(lat, lng) {
-            const coordText = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
-            
-            // Try to use the modern clipboard API
-            if (navigator.clipboard && window.isSecureContext) {
-                navigator.clipboard.writeText(coordText).then(() => {
-                    showSuccess('Koordinat berhasil disalin: ' + coordText);
-                }).catch(() => {
-                    // Fallback method
-                    fallbackCopyText(coordText);
-                });
-            } else {
-                // Fallback method for older browsers or non-secure contexts
-                fallbackCopyText(coordText);
-            }
-        };
-
-        // Fallback copy method
-        function fallbackCopyText(text) {
-            const textArea = document.createElement('textarea');
-            textArea.value = text;
-            textArea.style.position = 'fixed';
-            textArea.style.left = '-999999px';
-            textArea.style.top = '-999999px';
-            document.body.appendChild(textArea);
-            textArea.focus();
-            textArea.select();
-            
-            try {
-                document.execCommand('copy');
-                showSuccess('Koordinat berhasil disalin: ' + text);
-            } catch (err) {
-                showError('Gagal menyalin koordinat. Silakan salin manual: ' + text);
-            }
-            
-            document.body.removeChild(textArea);
-        }
-
-        function createDashboardChart() {
-            const ctx = document.getElementById('attributeChart').getContext('2d');
-            
-            if (attributeChart) {
-                attributeChart.destroy();
-            }
-            
-            // Count data points
-            const dataCount = currentData.length;
-            const attributeCount = selectedAttributes.size;
-            
-            attributeChart = new Chart(ctx, {
-                type: 'doughnut',
-                data: {
-                    labels: ['Total Titik', 'Atribut Aktif'],
-                    datasets: [{
-                        data: [dataCount, attributeCount],
-                        backgroundColor: ['#667eea', '#38a169'],
-                        borderWidth: 0
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: {
-                            position: 'right',
-                            labels: {
-                                font: {
-                                    family: 'Poppins',
-                                    size: 10
-                                },
-                                padding: 8,
-                                usePointStyle: true,
-                                pointStyle: 'circle'
-                            }
-                        }
-                    },
-                    layout: {
-                        padding: 5
-                    }
-                }
-            });
-            
-            // Create data list
-            createDataList();
-        }
-
-        function createDataList() {
-            const dataList = document.getElementById('dataList');
-            dataList.innerHTML = '';
-            
-            currentData.forEach((point, index) => {
-                const item = document.createElement('div');
-                item.className = 'data-item';
-                item.onclick = () => zoomToPoint(point);
-                
-                const Name = point.attributes.Name || `Titik ${index + 1}`;
-                const coords = `${point.lat.toFixed(4)}, ${point.lng.toFixed(4)}`;
-                
-                item.innerHTML = `
-                    <div class="data-item-name">${Name}</div>
-                    <div class="data-item-coords">${coords}</div>
-                `;
-                
-                dataList.appendChild(item);
-            });
-        }
-
-        function zoomToPoint(point) {
-            map.setView([point.lat, point.lng], 18);
-            
-            // Find and highlight the marker temporarily
-            currentLayer.eachLayer(layer => {
-                if (layer.getLatLng && 
-                    Math.abs(layer.getLatLng().lat - point.lat) < 0.0001 && 
-                    Math.abs(layer.getLatLng().lng - point.lng) < 0.0001) {
-                    
-                    // Temporarily change style
-                    const originalStyle = {
-                        fillColor: layer.options.fillColor,
-                        color: layer.options.color
-                    };
-                    
-                    layer.setStyle({
-                        fillColor: '#e53e3e',
-                        color: '#c53030'
-                    });
-                    
-                    // Reset after 3 seconds
-                    setTimeout(() => {
-                        layer.setStyle(originalStyle);
-                    }, 3000);
-                    
-                    // Open popup immediately
-                    setTimeout(() => {
-                        layer.fire('click');
-                    }, 200);
-                }
-            });
-        }
-
-        function enableAnalysisButtons() {
-            document.getElementById('distanceBtn').disabled = false;
-            document.getElementById('bufferBtn').disabled = false;
-            document.getElementById('nearestBtn').disabled = false;
-            document.getElementById('moranBtn').disabled = false;
-            document.getElementById('ripleyBtn').disabled = false;
-            document.getElementById('refreshBtn').disabled = false;
-        }
-
-        function toggleAnalysisMode(mode) {
-            const buttons = document.querySelectorAll('.analysis-btn');
-            buttons.forEach(btn => btn.classList.remove('active'));
-            
-            // Hide all controls first
-            document.getElementById('bufferControls').style.display = 'none';
-            
-            if (analysisMode === mode) {
-                analysisMode = null;
-                selectedPoints = [];
-                bufferPoint = null;
-                clearAnalysisResults();
-            } else {
-                analysisMode = mode;
-                document.getElementById(mode + 'Btn').classList.add('active');
-                selectedPoints = [];
-                bufferPoint = null;
-                
-                if (mode === 'buffer') {
-                    document.getElementById('bufferControls').style.display = 'block';
-                } else if (mode === 'nearest') {
-                    performNearestNeighborAnalysis();
-                }
-            }
-        }
-
-        function handleAnalysisClick(marker, pointData) {
-            if (analysisMode === 'distance') {
-                selectedPoints.push({marker, pointData});
-                marker.setStyle({fillColor: '#e53e3e', color: '#c53030'});
-                
-                if (selectedPoints.length === 2) {
-                    calculateDistance();
-                }
-            } else if (analysisMode === 'buffer') {
-                // Reset previous selection
-                if (bufferPoint && bufferPoint.marker) {
-                    bufferPoint.marker.setStyle({fillColor: '#667eea', color: '#4c51bf'});
-                }
-                
-                bufferPoint = {marker, pointData};
-                marker.setStyle({fillColor: '#38a169', color: '#2f855a'});
-                
-                showSuccess(`Titik buffer dipilih: ${pointData.attributes.Name || 'Titik'}. Atur radius dan klik "Terapkan Buffer".`);
-            }
-        }
-
-        function calculateDistance() {
-            const point1 = selectedPoints[0].pointData;
-            const point2 = selectedPoints[1].pointData;
-            
-            const distance = map.distance([point1.lat, point1.lng], [point2.lat, point2.lng]);
-            
-            // Draw line
-            const line = L.polyline([
-                [point1.lat, point1.lng],
-                [point2.lat, point2.lng]
-            ], {color: '#e53e3e', weight: 3}).addTo(map);
-            
-            analysisLayers.push(line);
-            
-            showAnalysisResults('distance', {
-                distance: distance,
-                point1: point1.attributes.Name || 'Titik 1',
-                point2: point2.attributes.Name || 'Titik 2'
-            });
-            
-            // Reset
-            setTimeout(() => {
-                selectedPoints.forEach(p => {
-                    p.marker.setStyle({fillColor: '#667eea', color: '#4c51bf'});
-                });
-                selectedPoints = [];
-                analysisMode = null;
-                document.getElementById('distanceBtn').classList.remove('active');
-            }, 100);
-        }
-
-        function applyBuffer() {
-            if (!bufferPoint) {
-                showError('Pilih titik untuk buffer terlebih dahulu!');
-                return;
-            }
-            
-            const radius = parseInt(document.getElementById('radiusSlider').value);
-            createBuffer(bufferPoint.pointData, radius);
-        }
-
-        function createBuffer(pointData, radius) {
-            // Clear previous buffer
-            analysisLayers.forEach(layer => {
-                if (map.hasLayer(layer)) {
-                    map.removeLayer(layer);
-                }
-            });
-            analysisLayers = [];
-            
-            const circle = L.circle([pointData.lat, pointData.lng], {
-                radius: radius,
-                fillColor: '#38a169',
-                color: '#2f855a',
-                weight: 2,
-                opacity: 0.8,
-                fillOpacity: 0.2
+        if (nearPt) {
+            const line = L.polyline([[pt.lat, pt.lng], [nearPt.lat, nearPt.lng]], {
+                color: '#0891b2', weight: 1.5, dashArray: '4 4', opacity: 0.6, pane: 'analysisPane'
             }).addTo(map);
-            
-            analysisLayers.push(circle);
-            
-            // Count points within buffer and collect their data
-            let pointsInBuffer = 0;
-            let bufferPoints = [];
-            currentData.forEach(point => {
-                const distance = map.distance([pointData.lat, pointData.lng], [point.lat, point.lng]);
-                if (distance <= radius && distance > 0) {
-                    pointsInBuffer++;
-                    bufferPoints.push({
-                        name: point.attributes.Name || `Titik ${currentData.indexOf(point) + 1}`,
-                        distance: distance,
-                        point: point,
-                        attributes: point.attributes
-                    });
-                }
-            });
-            
-            // Sort by distance
-            bufferPoints.sort((a, b) => a.distance - b.distance);
-            
-            currentAnalysisResults = {
-                type: 'buffer',
-                center: pointData.attributes.Name || 'Titik Terpilih',
-                radius: radius,
-                pointsInBuffer: pointsInBuffer,
-                bufferPoints: bufferPoints,
-                centerPoint: pointData
-            };
-            
-            showAnalysisResults('buffer', currentAnalysisResults);
+            analysisLayers.push(line);
         }
 
-        function performNearestNeighborAnalysis() {
-            if (currentData.length < 2) {
-                showError('Minimal 2 titik diperlukan untuk analisis Nearest Neighbor');
-                return;
+        total += nearD;
+    });
+    const n = active.length, avg = total / n, area = calculateBoundingBoxArea(active);
+    const density = n / area, expectedD = 0.5 / Math.sqrt(density), se = 0.26136 / Math.sqrt(n * density);
+    const zScore = (avg - expectedD) / se, rRatio = avg / expectedD;
+    currentAnalysisResults = { type: 'nearest', zScore, rRatio, interpretation: rRatio < 1 ? 'Terklaster' : 'Tersebar' };
+    showAnalysisResults('nearest', currentAnalysisResults);
+}
+
+// ── Moran's I ───────────────────────────────────────────
+function populateMoranAttrSelect() {
+    const sel = document.getElementById('moranAttrSelect');
+    if (!sel) return;
+    sel.innerHTML = '<option value="_lat">Latitude (default)</option>';
+    if (currentData.length) {
+        Object.keys(currentData[0].attributes).forEach(k => {
+            if (!isNaN(parseFloat(currentData[0].attributes[k]))) {
+                const opt = document.createElement('option');
+                opt.value = k; opt.textContent = k;
+                sel.appendChild(opt);
             }
-            
-            let totalDistance = 0;
-            let minDistance = Infinity;
-            let maxDistance = 0;
-            let connections = 0;
-            let minPair = null;
-            let maxPair = null;
-            
-            currentData.forEach((point, i) => {
-                let nearestDistance = Infinity;
-                let nearestPoint = null;
-                
-                currentData.forEach((otherPoint, j) => {
-                    if (i !== j) {
-                        const distance = map.distance([point.lat, point.lng], [otherPoint.lat, otherPoint.lng]);
-                        if (distance < nearestDistance) {
-                            nearestDistance = distance;
-                            nearestPoint = otherPoint;
-                        }
-                    }
-                });
-                
-                if (nearestPoint) {
-                    totalDistance += nearestDistance;
-                    
-                    if (nearestDistance < minDistance) {
-                        minDistance = nearestDistance;
-                        minPair = {
-                            point1: point.attributes.Name || `Titik ${i + 1}`,
-                            point2: nearestPoint.attributes.Name || 'Titik'
-                        };
-                    }
-                    
-                    if (nearestDistance > maxDistance) {
-                        maxDistance = nearestDistance;
-                        maxPair = {
-                            point1: point.attributes.Name || `Titik ${i + 1}`,
-                            point2: nearestPoint.attributes.Name || 'Titik'
-                        };
-                    }
-                    
-                    connections++;
-                    
-                    // Draw connection line
-                    const line = L.polyline([
-                        [point.lat, point.lng],
-                        [nearestPoint.lat, nearestPoint.lng]
-                    ], {
-                        color: '#667eea',
-                        weight: 1,
-                        opacity: 0.6,
-                        dashArray: '5, 5'
-                    }).addTo(map);
-                    
-                    analysisLayers.push(line);
-                }
-            });
-            
-            const avgDistance = totalDistance / connections;
-            
-            // Calculate z-score for ANN
-            const n = currentData.length;
-            const area = calculateBoundingBoxArea();
-            const density = n / area;
-            const expectedDistance = 0.5 / Math.sqrt(density);
-            const standardError = 0.26136 / Math.sqrt(n * density);
-            const zScore = (avgDistance - expectedDistance) / standardError;
-            const rRatio = avgDistance / expectedDistance;
-            
-            const classification = classifyANN(zScore, rRatio);
-            
-            currentAnalysisResults = {
-                type: 'nearest',
-                totalPoints: currentData.length,
-                avgDistance: avgDistance,
-                minDistance: minDistance,
-                maxDistance: maxDistance,
-                minPair: minPair,
-                maxPair: maxPair,
-                zScore: zScore,
-                rRatio: rRatio,
-                classification: classification
-            };
-            
-            showAnalysisResults('nearest', currentAnalysisResults);
-        }
+        });
+    }
+}
+function performMoranAnalysis() {
+    const active = getActiveData();
+    if (active.length < 3) { showError('Minimal 3 titik aktif untuk Moran\'s I'); return; }
+    const attrKey = document.getElementById('moranAttrSelect').value;
+    const n = active.length, values = active.map(p => attrKey === '_lat' ? p.lat : (parseFloat(p.attributes[attrKey]) || 0));
+    const mean = values.reduce((a, b) => a + b, 0) / n;
+    let sumW = 0, sumWX = 0, sumX2 = 0;
+    active.forEach((p, i) => {
+        active.forEach((q, j) => {
+            if (i === j) return;
+            const d = map.distance([p.lat, p.lng], [q.lat, q.lng]);
+            const w = d > 0 ? 1 / d : 0;
+            sumW += w;
+            sumWX += w * (values[i] - mean) * (values[j] - mean);
+        });
+        sumX2 += Math.pow(values[i] - mean, 2);
+    });
+    const moranI = (n / sumW) * (sumWX / sumX2);
+    const zScore = (moranI + 1 / (n - 1)) / 0.1;
+    currentAnalysisResults = { type: 'moran', moranI, zScore, pola: moranI > 0 ? 'Positif (Klaster)' : 'Negatif (Dispersi)' };
+    showAnalysisResults('moran', currentAnalysisResults);
+}
 
-        function calculateBoundingBoxArea() {
-            if (currentData.length === 0) return 1;
-            
-            let minLat = currentData[0].lat;
-            let maxLat = currentData[0].lat;
-            let minLng = currentData[0].lng;
-            let maxLng = currentData[0].lng;
-            
-            currentData.forEach(point => {
-                minLat = Math.min(minLat, point.lat);
-                maxLat = Math.max(maxLat, point.lat);
-                minLng = Math.min(minLng, point.lng);
-                maxLng = Math.max(maxLng, point.lng);
-            });
-            
-            // Convert to approximate area in square meters
-            const latDiff = (maxLat - minLat) * 111320; // meters per degree latitude
-            const lngDiff = (maxLng - minLng) * 111320 * Math.cos((minLat + maxLat) / 2 * Math.PI / 180);
-            
-            return Math.max(latDiff * lngDiff, 1000000); // minimum 1 km²
-        }
+// ── Ripley's K ──────────────────────────────────────────────
+function performRipleyAnalysis() {
+    const active = getActiveData();
+    if (active.length < 5) { showError('Minimal 5 titik aktif untuk Ripley\'s K'); return; }
+    const n = active.length, area = calculateBoundingBoxArea(active), density = n / area;
+    const r = 1000;
+    let kVal = 0;
+    active.forEach((p, i) => active.forEach((q, j) => { if (i !== j && map.distance([p.lat, p.lng], [q.lat, q.lng]) <= r) kVal++; }));
+    kVal /= (n * density);
+    currentAnalysisResults = { type: 'ripley', maxDist: r, avgL: Math.sqrt(kVal / Math.PI) };
+    showAnalysisResults('ripley', currentAnalysisResults);
+}
 
-        function showAnalysisResults(type, data) {
-            const resultsContainer = document.getElementById('resultsContainer');
-            const analysisResults = document.getElementById('analysisResults');
-            
-            let content = '';
-            
-            if (type === 'distance') {
-                content = `
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-value">${(data.distance / 1000).toFixed(2)}</div>
-                            <div class="stat-label">Kilometer</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">${data.distance.toFixed(0)}</div>
-                            <div class="stat-label">Meter</div>
-                        </div>
-                    </div>
-                    <p style="margin-top: 1rem; font-size: 0.9rem; color: #718096;">
-                        Jarak antara <strong>${data.point1}</strong> dan <strong>${data.point2}</strong>
-                    </p>
-                `;
-            } else if (type === 'buffer') {
-                content = `
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-value">${(data.radius / 1000).toFixed(1)}</div>
-                            <div class="stat-label">Radius (km)</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">${data.pointsInBuffer}</div>
-                            <div class="stat-label">Titik dalam Buffer</div>
-                        </div>
-                    </div>
-                    <p style="margin-top: 1rem; font-size: 0.9rem; color: #718096;">
-                        Buffer dari <strong>${data.center}</strong>
-                    </p>
-                `;
-                
-                if (data.bufferPoints && data.bufferPoints.length > 0) {
-                    content += `
-                        <div style="margin-top: 1rem; padding: 1rem; background: white; border-radius: 8px;">
-                            <h5 style="margin-bottom: 0.75rem; color: #2d3748;">Titik dalam Buffer:</h5>
-                            <div style="max-height: 200px; overflow-y: auto;">
-                    `;
-                    
-                    data.bufferPoints.forEach((bufferPoint, index) => {
-                        content += `
-                            <div class="data-item" onclick="zoomToBufferPoint('${bufferPoint.point.lat}', '${bufferPoint.point.lng}')" style="margin-bottom: 0.5rem; cursor: pointer;">
-                                <div class="data-item-name">${bufferPoint.name}</div>
-                                <div class="data-item-coords">Jarak: ${bufferPoint.distance.toFixed(0)} meter</div>
-                            </div>
-                        `;
-                    });
-                    
-                    content += `
-                            </div>
-                        </div>
-                    `;
-                }
-            } else if (type === 'nearest') {
-                content = `
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-value">${data.totalPoints}</div>
-                            <div class="stat-label">Total Titik</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">${data.avgDistance.toFixed(0)}</div>
-                            <div class="stat-label">Rata-rata (m)</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">${data.minDistance.toFixed(0)}</div>
-                            <div class="stat-label">Terdekat (m)</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">${data.maxDistance.toFixed(0)}</div>
-                            <div class="stat-label">Terjauh (m)</div>
-                        </div>
-                    </div>
-                    <div style="margin-top: 1rem; padding: 1rem; background: white; border-radius: 8px;">
-                        <h5 style="margin-bottom: 0.5rem; color: #2d3748;">Klasifikasi ANN:</h5>
-                        <p style="font-weight: 500; color: #667eea; margin-bottom: 0.5rem;">${data.classification}</p>
-                        <p style="font-size: 0.85rem; color: #718096; margin-bottom: 0.25rem;">
-                            <strong>Z-Score:</strong> ${data.zScore.toFixed(3)}
-                        </p>
-                        <p style="font-size: 0.85rem; color: #718096; margin-bottom: 0.5rem;">
-                            <strong>R-Ratio:</strong> ${data.rRatio.toFixed(3)}
-                        </p>
-                        <div style="font-size: 0.8rem; color: #4a5568;">
-                            <p><strong>Jarak Terdekat:</strong> ${data.minPair.point1} ↔ ${data.minPair.point2} (${data.minDistance.toFixed(0)}m)</p>
-                            <p><strong>Jarak Terjauh:</strong> ${data.maxPair.point1} ↔ ${data.maxPair.point2} (${data.maxDistance.toFixed(0)}m)</p>
-                        </div>
-                    </div>
-                `;
-            } else if (type === 'moran') {
-                content = `
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-value">${data.moranI.toFixed(4)}</div>
-                            <div class="stat-label">Moran's I</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">${data.zScore.toFixed(3)}</div>
-                            <div class="stat-label">Z-Score</div>
-                        </div>
-                    </div>
-                    <div style="margin-top: 1rem; padding: 1rem; background: white; border-radius: 8px;">
-                        <h5 style="margin-bottom: 0.5rem; color: #2d3748;">Interpretasi:</h5>
-                        <p style="font-weight: 500; color: #667eea;">${data.interpretation}</p>
-                        <p style="font-size: 0.85rem; color: #718096; margin-top: 0.5rem;">
-                            Expected I: ${data.expectedI.toFixed(4)}
-                        </p>
-                    </div>
-                `;
-            } else if (type === 'ripley') {
-                content = `
-                    <div style="margin-bottom: 1rem; padding: 1rem; background: white; border-radius: 8px;">
-                        <h5 style="margin-bottom: 0.5rem; color: #2d3748;">Pola Distribusi:</h5>
-                        <p style="font-weight: 500; color: #667eea; margin-bottom: 0.5rem;">${data.pattern}</p>
-                        <p style="font-size: 0.85rem; color: #718096;">
-                            Rata-rata L(d) - d: ${data.avgDifference.toFixed(2)}
-                        </p>
-                    </div>
-                    <div style="background: white; border-radius: 8px; padding: 1rem;">
-                        <h5 style="margin-bottom: 0.75rem; color: #2d3748;">Hasil per Jarak:</h5>
-                        <div style="max-height: 200px; overflow-y: auto;">
-                `;
-                
-                data.results.forEach(result => {
-                    content += `
-                        <div style="padding: 0.5rem; margin-bottom: 0.5rem; background: #f7fafc; border-radius: 6px; font-size: 0.85rem;">
-                            <div><strong>${result.distance}m:</strong> L(d) = ${result.lValue.toFixed(1)}, Expected = ${result.expectedL}</div>
-                            <div style="color: ${result.difference > 0 ? '#38a169' : result.difference < 0 ? '#e53e3e' : '#718096'};">
-                                Difference: ${result.difference.toFixed(2)}
-                            </div>
-                        </div>
-                    `;
-                });
-                
-                content += `
-                        </div>
-                    </div>
-                `;
+// ── KDE ───────────────────────────────────
+// ── KDE (Silverman 1986) ───────────────────────────────────
+function performKDEAnalysis() {
+    const active = getActiveData();
+    if (active.length < 3) { showError('Minimal 3 titik aktif untuk KDE'); return; }
+    setProgress('analysisProgressWrap', 'analysisProgressFill', 5);
+    stopKDEAnimation(); analysisLayers.forEach(l => { try { if (l && l.remove) l.remove(); else if (map.hasLayer(l)) map.removeLayer(l); } catch (e) { } }); analysisLayers = [];
+    if (kdeLegend) { kdeLegend.remove(); kdeLegend = null; }
+    const bw = parseInt(document.getElementById('kdeBandwidthSlider').value), res = parseInt(document.getElementById('kdeResSlider').value), doAnim = document.getElementById('kdeAnimSlider').value === '1';
+    let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+    active.forEach(p => { if (p.lat < minLat) minLat = p.lat; if (p.lat > maxLat) maxLat = p.lat; if (p.lng < minLng) minLng = p.lng; if (p.lng > maxLng) maxLng = p.lng; });
+    const lp = (maxLat - minLat) * 0.2 || 0.05, lgp = (maxLng - minLng) * 0.2 || 0.05;
+    minLat -= lp; maxLat += lp; minLng -= lgp; maxLng += lgp;
+    const ls = (maxLat - minLat) / res, lgs = (maxLng - minLng) / res; let maxD = 0;
+    const grid = [];
+    const processChunk = (rStart, rEnd, callback) => {
+        for (let r = rStart; r < rEnd; r++) {
+            grid[r] = [];
+            for (let c = 0; c <= res; c++) {
+                const lat = minLat + r * ls, lng = minLng + c * lgs; let den = 0;
+                active.forEach(pt => { const dist = map.distance([lat, lng], [pt.lat, pt.lng]); const u = dist / bw; if (u <= 1) den += (3 / Math.PI) * (1 - u * u); });
+                den /= (active.length * bw * bw); grid[r][c] = { lat, lng, density: den }; if (den > maxD) maxD = den;
             }
-            
-            analysisResults.innerHTML = content;
-            resultsContainer.style.display = 'block';
+            const pct = 5 + ((r + 1) / (res + 1)) * 80;
+            setProgress('analysisProgressWrap', 'analysisProgressFill', pct);
         }
-
-        function performMoranAnalysis() {
-            if (currentData.length < 3) {
-                showError('Minimal 3 titik diperlukan untuk analisis Moran\'s I');
-                return;
+        callback();
+    };
+    const finishKDE = () => {
+        if (maxD === 0) { showError('Density nol. Perbesar bandwidth.'); setProgress('analysisProgressWrap', 'analysisProgressFill', 0); return; }
+        kdeGridData = { grid, maxDensity: maxD, resolution: res, latStep: ls, lngStep: lgs };
+        if (doAnim) startKDECanvasAnimation();
+        else {
+            for (let r = 0; r < res; r++)for (let c = 0; c < res; c++) {
+                const cell = grid[r][c], norm = cell.density / maxD; if (norm < 0.03) continue;
+                const rect = L.rectangle([[cell.lat, cell.lng], [cell.lat + ls, cell.lng + lgs]], {
+                    color: 'transparent', weight: 0, fillColor: densityToColor(norm),
+                    fillOpacity: Math.min(0.85, norm * 0.9 + 0.1), pane: 'kdePane'
+                }).addTo(map);
+                analysisLayers.push(rect);
             }
-            
-            // Calculate Moran's I
-            const n = currentData.length;
-            let sumW = 0;
-            let sumWX = 0;
-            let sumX = 0;
-            let sumX2 = 0;
-            
-            // Use latitude as the variable for simplicity
-            const values = currentData.map(point => point.lat);
-            const mean = values.reduce((a, b) => a + b, 0) / n;
-            
-            // Calculate weights and sums
-            for (let i = 0; i < n; i++) {
-                for (let j = 0; j < n; j++) {
-                    if (i !== j) {
-                        const distance = map.distance([currentData[i].lat, currentData[i].lng], 
-                                                    [currentData[j].lat, currentData[j].lng]);
-                        const weight = distance > 0 ? 1 / distance : 0;
-                        sumW += weight;
-                        sumWX += weight * (values[i] - mean) * (values[j] - mean);
-                    }
-                }
-                sumX += values[i] - mean;
-                sumX2 += Math.pow(values[i] - mean, 2);
-            }
-            
-            const moranI = (n / sumW) * (sumWX / sumX2);
-            const expectedI = -1 / (n - 1);
-            const varianceI = (n * n - 3 * n + 3) / ((n - 1) * (n - 2) * (n - 3));
-            const zScore = (moranI - expectedI) / Math.sqrt(varianceI);
-            
-            let interpretation = '';
-            if (zScore > 1.96) interpretation = 'Autokorelasi Positif Signifikan (Terklaster)';
-            else if (zScore < -1.96) interpretation = 'Autokorelasi Negatif Signifikan (Tersebar)';
-            else interpretation = 'Tidak Ada Autokorelasi Spasial (Acak)';
-            
-            currentAnalysisResults = {
-                type: 'moran',
-                moranI: moranI,
-                expectedI: expectedI,
-                zScore: zScore,
-                interpretation: interpretation
-            };
-            
-            showAnalysisResults('moran', currentAnalysisResults);
         }
-        
-        function performRipleyAnalysis() {
-            if (currentData.length < 5) {
-                showError('Minimal 5 titik diperlukan untuk analisis Ripley\'s K');
-                return;
-            }
-            
-            const distances = [500, 1000, 1500, 2000, 2500]; // meters
-            const results = [];
-            const n = currentData.length;
-            const area = calculateBoundingBoxArea();
-            const density = n / area;
-            
-            distances.forEach(r => {
-                let kValue = 0;
-                
-                currentData.forEach((point, i) => {
-                    let count = 0;
-                    currentData.forEach((otherPoint, j) => {
-                        if (i !== j) {
-                            const distance = map.distance([point.lat, point.lng], [otherPoint.lat, otherPoint.lng]);
-                            if (distance <= r) {
-                                count++;
-                            }
-                        }
-                    });
-                    kValue += count;
-                });
-                
-                kValue = kValue / (n * density);
-                const expectedK = Math.PI * r * r;
-                const lValue = Math.sqrt(kValue / Math.PI);
-                const expectedL = r;
-                
-                results.push({
-                    distance: r,
-                    kValue: kValue,
-                    expectedK: expectedK,
-                    lValue: lValue,
-                    expectedL: expectedL,
-                    difference: lValue - expectedL
-                });
-            });
-            
-            // Determine pattern
-            const avgDifference = results.reduce((sum, r) => sum + r.difference, 0) / results.length;
-            let pattern = '';
-            if (avgDifference > 0) pattern = 'Terklaster (Clustered)';
-            else if (avgDifference < 0) pattern = 'Tersebar (Dispersed)';
-            else pattern = 'Acak (Random)';
-            
-            currentAnalysisResults = {
-                type: 'ripley',
-                results: results,
-                pattern: pattern,
-                avgDifference: avgDifference
-            };
-            
-            showAnalysisResults('ripley', currentAnalysisResults);
-        }
-        
-        function refreshAnalysis() {
-            // Reset analysis mode
-            analysisMode = null;
-            selectedPoints = [];
-            bufferPoint = null;
-            currentAnalysisResults = null;
-            
-            // Remove active class from buttons
-            document.querySelectorAll('.analysis-btn').forEach(btn => btn.classList.remove('active'));
-            
-            // Hide controls
-            document.getElementById('bufferControls').style.display = 'none';
-            
-            // Clear analysis layers
-            analysisLayers.forEach(layer => {
-                if (map.hasLayer(layer)) {
-                    map.removeLayer(layer);
-                }
-            });
-            analysisLayers = [];
-            
-            // Reset marker styles
-            if (currentLayer) {
-                currentLayer.eachLayer(layer => {
-                    if (layer.setStyle) {
-                        layer.setStyle({
-                            fillColor: '#667eea',
-                            color: '#4c51bf'
-                        });
-                    }
-                });
-            }
-            
-            // Clear results
-            clearAnalysisResults();
-            
-            showSuccess('Analisis berhasil direset!');
-        }
-
-        function clearAnalysisResults() {
-            document.getElementById('resultsContainer').style.display = 'none';
-        }
-
-        function showLoading(show) {
-            document.getElementById('loading').style.display = show ? 'block' : 'none';
-        }
-
-        function showSuccess(message) {
-            const successMsg = document.getElementById('successMessage');
-            successMsg.textContent = message;
-            successMsg.style.display = 'block';
-            setTimeout(() => {
-                successMsg.style.display = 'none';
-            }, 5000);
-        }
-
-        function showError(message) {
-            const errorMsg = document.getElementById('errorMessage');
-            document.getElementById('errorText').textContent = message;
-            errorMsg.style.display = 'block';
-            setTimeout(() => {
-                errorMsg.style.display = 'none';
-            }, 5000);
-        }
-
-        // Panel toggle functions
-        function toggleLeftPanel() {
-            const panel = document.getElementById('leftPanel');
-            const toggle = document.getElementById('leftToggle');
-            const icon = toggle.querySelector('i');
-            
-            panel.classList.toggle('panel-hidden');
-            toggle.classList.toggle('hidden');
-            
-            if (panel.classList.contains('panel-hidden')) {
-                icon.className = 'fas fa-chevron-right';
+        addKDELegend(bw);
+        const flat = grid.flat().map(c => c.density), hotCells = flat.filter(d => d / maxD >= 0.7).length;
+        // Build zone data: find which points fall in each density zone
+        const zones = { sangatTinggi: [], tinggi: [], sedang: [], rendah: [], sangatRendah: [] };
+        active.forEach(pt => {
+            // Find the grid cell closest to this point
+            const rIdx = Math.floor((pt.lat - minLat) / ls);
+            const cIdx = Math.floor((pt.lng - minLng) / lgs);
+            if (rIdx >= 0 && rIdx <= res && cIdx >= 0 && cIdx <= res && grid[rIdx] && grid[rIdx][cIdx]) {
+                const norm = grid[rIdx][cIdx].density / maxD;
+                if (norm >= 0.8) zones.sangatTinggi.push(pt.displayName);
+                else if (norm >= 0.6) zones.tinggi.push(pt.displayName);
+                else if (norm >= 0.4) zones.sedang.push(pt.displayName);
+                else if (norm >= 0.2) zones.rendah.push(pt.displayName);
+                else zones.sangatRendah.push(pt.displayName);
             } else {
-                icon.className = 'fas fa-chevron-left';
+                zones.sangatRendah.push(pt.displayName);
+            }
+        });
+        currentAnalysisResults = { type: 'kde', bandwidth: bw, resolution: res, maxDensity: maxD, hotCells, totalCells: flat.length, n: active.length, animated: doAnim, zones };
+        showAnalysisResults('kde', currentAnalysisResults);
+        setProgress('analysisProgressWrap', 'analysisProgressFill', 100);
+        setTimeout(() => setProgress('analysisProgressWrap', 'analysisProgressFill', 0), 500);
+    };
+    processChunk(0, res + 1, finishKDE);
+}
+
+function startKDECanvasAnimation() {
+    if (kdeCanvas) { kdeCanvas.remove(); kdeCanvas = null; }
+    const KDELayer = L.Layer.extend({
+        onAdd(map) {
+            const pane = map.getPane('kdePane');
+            kdeCanvas = L.DomUtil.create('canvas', '');
+            Object.assign(kdeCanvas.style, { position: 'absolute', top: 0, left: 0, pointerEvents: 'none', opacity: 0 });
+            pane.appendChild(kdeCanvas);
+            this._map = map; map.on('moveend zoomend resize', this._redraw, this); this._redraw();
+            let op = 0; const fi = setInterval(() => { op = Math.min(1, op + 0.05); kdeCanvas.style.opacity = op; if (op >= 1) clearInterval(fi); }, 30);
+        },
+        onRemove(map) { if (kdeCanvas) { kdeCanvas.remove(); kdeCanvas = null; } map.off('moveend zoomend resize', this._redraw, this); },
+        _redraw() {
+            if (!kdeCanvas || !kdeGridData) return;
+            const { grid, maxDensity, resolution, latStep, lngStep } = kdeGridData, sz = this._map.getSize();
+            kdeCanvas.width = sz.x; kdeCanvas.height = sz.y;
+            const b = this._map.getBounds();
+            const nw = this._map.latLngToLayerPoint(b.getNorthWest());
+            kdeCanvas.style.left = nw.x + 'px'; kdeCanvas.style.top = nw.y + 'px';
+            const ctx = kdeCanvas.getContext('2d'); ctx.clearRect(0, 0, sz.x, sz.y);
+            for (let r = 0; r < resolution; r++) {
+                for (let c = 0; c < resolution; c++) {
+                    const cell = grid[r][c], norm = cell.density / maxDensity;
+                    if (norm < 0.03) continue;
+                    const sw = this._map.latLngToLayerPoint([cell.lat, cell.lng]);
+                    const ne = this._map.latLngToLayerPoint([cell.lat + latStep, cell.lng + lngStep]);
+                    const x = Math.min(sw.x, ne.x) - nw.x;
+                    const y = Math.min(sw.y, ne.y) - nw.y;
+                    const w = Math.abs(ne.x - sw.x) + 1;
+                    const h = Math.abs(ne.y - sw.y) + 1;
+                    ctx.fillStyle = densityToColorAlpha(norm, 1.0);
+                    ctx.fillRect(x, y, w, h);
+                }
             }
         }
+    });
+    const inst = new KDELayer(); inst.addTo(map); analysisLayers.push({ remove: () => inst.remove() });
+    if (kdeAnimFrame) cancelAnimationFrame(kdeAnimFrame); let t = 0;
+    function pulse() { if (!kdeCanvas) return; t += 0.025; kdeCanvas.style.opacity = (0.875 + 0.125 * Math.sin(t)).toFixed(3); kdeAnimFrame = requestAnimationFrame(pulse); } pulse();
+}
+function stopKDEAnimation() { if (kdeAnimFrame) { cancelAnimationFrame(kdeAnimFrame); kdeAnimFrame = null; } if (kdeCanvas) { kdeCanvas.remove(); kdeCanvas = null; } }
+function densityToColorAlpha(n, a) { let r, g, b; if (n < 0.2) { r = 187; g = 247; b = 208; } else if (n < 0.4) { r = 253; g = 224; b = 71; } else if (n < 0.6) { r = 251; g = 146; b = 60; } else if (n < 0.8) { r = 220; g = 38; b = 38; } else { r = 127; g = 29; b = 29; } return `rgba(${r},${g},${b},${(a * (n * 0.8 + 0.2)).toFixed(2)})`; }
+function densityToColor(n) { if (n < 0.2) return '#bbf7d0'; if (n < 0.4) return '#fde047'; if (n < 0.6) return '#fb923c'; if (n < 0.8) return '#dc2626'; return '#7f1d1d'; }
+function addKDELegend(bw) { if (kdeLegend) { kdeLegend.remove(); kdeLegend = null; } kdeLegend = L.control({ position: 'bottomleft' }); kdeLegend.onAdd = function () { const div = L.DomUtil.create('div', 'kde-legend-wrap'); div.innerHTML = `<div class="kde-legend-title"><i class="fas fa-fire-alt" style="color:#e11d48;margin-right:4px"></i>KDE Hotspot</div><div class="kde-legend-item"><div class="kde-legend-swatch" style="background:#7f1d1d"></div>Sangat Tinggi (&gt;80%)</div><div class="kde-legend-item"><div class="kde-legend-swatch" style="background:#dc2626"></div>Tinggi (60–80%)</div><div class="kde-legend-item"><div class="kde-legend-swatch" style="background:#fb923c"></div>Sedang (40–60%)</div><div class="kde-legend-item"><div class="kde-legend-swatch" style="background:#fde047"></div>Rendah (20–40%)</div><div class="kde-legend-item"><div class="kde-legend-swatch" style="background:#bbf7d0"></div>Sangat Rendah</div><div style="font-size:9px;color:#94a3b8;margin-top:6px">Bandwidth: ${bw}m · n=${currentData.length}</div>`; return div; }; kdeLegend.addTo(map); }
 
-        function toggleRightPanel() {
-            const panel = document.getElementById('rightPanel');
-            const toggle = document.getElementById('rightToggle');
-            const icon = toggle.querySelector('i');
-            
-            panel.classList.toggle('panel-hidden');
-            toggle.classList.toggle('hidden');
-            
-            if (panel.classList.contains('panel-hidden')) {
-                icon.className = 'fas fa-chevron-left';
-            } else {
-                icon.className = 'fas fa-chevron-right';
+// ── Gi* (Ord & Getis 1995) ─────────────────────────────────
+function populateGiAttrSelect() { const sel = document.getElementById('giAttrSelect'); sel.innerHTML = '<option value="_lat">Latitude (default)</option>'; if (currentData.length) { Object.keys(currentData[0].attributes).forEach(k => { if (!isNaN(parseFloat(currentData[0].attributes[k]))) { const opt = document.createElement('option'); opt.value = k; opt.textContent = k; sel.appendChild(opt); } }); } }
+function normalCDF(z) { const t = 1 / (1 + 0.2316419 * Math.abs(z)), d = 0.3989423 * Math.exp(-z * z / 2), p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.7814779 + t * (-1.8212560 + t * 1.3302744)))); return z > 0 ? 1 - p : p; }
+function classifyGiStar(z) { if (z >= 2.576) return { type: 'hotspot', conf: '99%', color: '#7f1d1d', label: 'Hotspot 99%' }; if (z >= 1.96) return { type: 'hotspot', conf: '95%', color: '#dc2626', label: 'Hotspot 95%' }; if (z >= 1.645) return { type: 'hotspot', conf: '90%', color: '#fb923c', label: 'Hotspot 90%' }; if (z <= -2.576) return { type: 'coldspot', conf: '99%', color: '#1e3a8a', label: 'Coldspot 99%' }; if (z <= -1.96) return { type: 'coldspot', conf: '95%', color: '#2563eb', label: 'Coldspot 95%' }; if (z <= -1.645) return { type: 'coldspot', conf: '90%', color: '#93c5fd', label: 'Coldspot 90%' }; return { type: 'ns', conf: '', color: '#94a3b8', label: 'Tidak Signifikan' }; }
+
+function performGiStarAnalysis() {
+    const active = getActiveData();
+    if (active.length < 5) { showError('Minimal 5 titik aktif untuk Getis-Ord Gi*'); return; }
+    setProgress('analysisProgressWrap', 'analysisProgressFill', 10);
+    analysisLayers.forEach(l => { try { if (l && l.remove) l.remove(); else if (map.hasLayer(l)) map.removeLayer(l); } catch (e) { } }); analysisLayers = [];
+    if (giLegend) { giLegend.remove(); giLegend = null; }
+    const thresh = parseInt(document.getElementById('giThreshSlider').value), attrKey = document.getElementById('giAttrSelect').value, n = active.length;
+    const x = active.map(p => attrKey === '_lat' ? p.lat : (parseFloat(p.attributes[attrKey]) || p.lat));
+    const xBar = x.reduce((a, b) => a + b, 0) / n, S = Math.sqrt(x.reduce((a, v) => a + (v - xBar) ** 2, 0) / n);
+    const W = []; for (let i = 0; i < n; i++) { W[i] = []; for (let j = 0; j < n; j++)W[i][j] = map.distance([active[i].lat, active[i].lng], [active[j].lat, active[j].lng]) <= thresh ? 1 : 0; }
+    setProgress('analysisProgressWrap', 'analysisProgressFill', 40);
+    const results = active.map((pt, i) => { const wi = W[i], sumW = wi.reduce((a, b) => a + b, 0), sumW2 = wi.reduce((a, b) => a + b * b, 0), sumWx = wi.reduce((a, w, j) => a + w * x[j], 0); const num = sumWx - xBar * sumW; const denom = S > 0 ? S * Math.sqrt((n * sumW2 - sumW ** 2) / (n - 1)) : 0.0001; const zScore = denom > 0 ? num / denom : 0, pValue = 2 * (1 - normalCDF(Math.abs(zScore))); return { ...pt, zScore, pValue, cls: classifyGiStar(zScore) }; });
+    setProgress('analysisProgressWrap', 'analysisProgressFill', 70);
+    const giBaseRadius = Math.max(thresh * 0.35, 10);
+    results.forEach((res, i) => { const radiusM = Math.max(giBaseRadius * 0.4, Math.min(giBaseRadius, giBaseRadius * (Math.abs(res.zScore) / 3))); const m = L.circle([res.lat, res.lng], { radius: radiusM, fillColor: res.cls.color, color: 'rgba(255,255,255,0.7)', weight: 1.5, opacity: 1, fillOpacity: 0.72, pane: 'analysisPane' }).addTo(map); const popupContent = `<div class="popup-wrap" style="min-width:170px"><div class="popup-name-display" style="font-size:12px">${escapeHTML(res.displayName)}</div><div class="popup-coords"><div><span class="popup-coord-label">Z-Score</span><br><span class="popup-coord-val" style="color:${res.cls.color};font-weight:600">${res.zScore.toFixed(3)}</span></div><div><span class="popup-coord-label">P-Value</span><br><span class="popup-coord-val">${res.pValue.toFixed(4)}</span></div></div><div class="interp-card" style="margin:0"><div class="interp-value" style="color:${res.cls.color}">${res.cls.label}</div></div></div>`; m.bindPopup(popupContent, { maxWidth: 220, className: '', closeButton: false }); analysisLayers.push(m); });
+    giLegend = L.control({ position: 'bottomleft' }); giLegend.onAdd = function () { const div = L.DomUtil.create('div', 'gi-legend-wrap'); div.innerHTML = `<div class="gi-legend-title"><i class="fas fa-map-marked-alt" style="color:#d97706;margin-right:4px"></i>Getis-Ord Gi*</div><div class="gi-legend-item"><div class="gi-legend-swatch" style="background:#7f1d1d"></div>Hotspot 99%</div><div class="gi-legend-item"><div class="gi-legend-swatch" style="background:#dc2626"></div>Hotspot 95%</div><div class="gi-legend-item"><div class="gi-legend-swatch" style="background:#fb923c"></div>Hotspot 90%</div><div class="gi-legend-item"><div class="gi-legend-swatch" style="background:#94a3b8"></div>Tidak Signifikan</div><div class="gi-legend-item"><div class="gi-legend-swatch" style="background:#93c5fd"></div>Coldspot 90%</div><div class="gi-legend-item"><div class="gi-legend-swatch" style="background:#2563eb"></div>Coldspot 95%</div><div class="gi-legend-item"><div class="gi-legend-swatch" style="background:#1e3a8a"></div>Coldspot 99%</div><div style="font-size:9px;color:#94a3b8;margin-top:6px">Threshold: ${thresh}m · n=${n} aktif</div>`; return div; }; giLegend.addTo(map);
+    const hot95 = results.filter(r => r.zScore >= 1.96).length, cold95 = results.filter(r => r.zScore <= -1.96).length, ns = results.filter(r => Math.abs(r.zScore) < 1.645).length;
+    const topHot = results.filter(r => r.cls.type === 'hotspot').sort((a, b) => b.zScore - a.zScore).slice(0, 3);
+    const topCold = results.filter(r => r.cls.type === 'coldspot').sort((a, b) => a.zScore - b.zScore).slice(0, 3);
+    setProgress('analysisProgressWrap', 'analysisProgressFill', 100);
+    currentAnalysisResults = { type: 'gi', hot95, cold95, ns, n, threshold: thresh, attrKey, topHot, topCold }; showAnalysisResults('gi', currentAnalysisResults);
+    setTimeout(() => setProgress('analysisProgressWrap', 'analysisProgressFill', 0), 500);
+}
+
+// ── Standard Deviational Ellipse (SDE) — PROYEKSI ──────────
+function performSDEAnalysis() {
+    const active = getActiveData();
+    if (active.length < 3) { showError('Minimal 3 titik aktif untuk SDE'); return; }
+    setProgress('analysisProgressWrap', 'analysisProgressFill', 30);
+    const projected = active.map(p => {
+        const merc = L.CRS.EPSG3857.project(L.latLng(p.lat, p.lng));
+        return turf.point([merc.x, merc.y]);
+    });
+    const fc = turf.featureCollection(projected);
+    const sdeProj = turf.standardDeviationalEllipse(fc);
+    setProgress('analysisProgressWrap', 'analysisProgressFill', 70);
+    const coords = turf.getCoords(sdeProj);
+    const unprojected = coords[0].map(c => {
+        const latlng = L.CRS.EPSG3857.unproject(L.point(c[0], c[1]));
+        return [latlng.lng, latlng.lat];
+    });
+    sdeProj.geometry.coordinates = [unprojected];
+    const layer = L.geoJSON(sdeProj, {
+        style: { color: '#8b5cf6', weight: 2, fillColor: '#8b5cf6', fillOpacity: 0.15, dashArray: '5,5' },
+        pane: 'analysisPane'
+    }).addTo(map);
+    analysisLayers.push(layer);
+    const area = turf.area(sdeProj);
+    const props = sdeProj.properties;
+    setProgress('analysisProgressWrap', 'analysisProgressFill', 100);
+    currentAnalysisResults = {
+        type: 'sde', n: active.length, area: area, center: props.meanCenter,
+        semiMajor: props.semiMajor, semiMinor: props.semiMinor, rotation: props.angle
+    };
+    showAnalysisResults('sde', currentAnalysisResults);
+    setTimeout(() => setProgress('analysisProgressWrap', 'analysisProgressFill', 0), 500);
+}
+
+// ── Voronoi Polygons ─────────────────────────────────────────
+function performVoronoiAnalysis() {
+    const active = getActiveData();
+    if (active.length < 3) { showError('Minimal 3 titik aktif untuk Voronoi'); return; }
+
+    analysisLayers.forEach(l => { try { if (l && l.remove) l.remove(); else if (map.hasLayer(l)) map.removeLayer(l); } catch (e) { } }); analysisLayers = [];
+
+    const points = turf.featureCollection(active.map(p => turf.point([p.lng, p.lat])));
+    let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+    active.forEach(p => { if (p.lat < minLat) minLat = p.lat; if (p.lat > maxLat) maxLat = p.lat; if (p.lng < minLng) minLng = p.lng; if (p.lng > maxLng) maxLng = p.lng; });
+
+    const margin = 0.05;
+    const bbox = [minLng - margin, minLat - margin, maxLng + margin, maxLat + margin];
+    const voronoi = turf.voronoi(points, { bbox });
+
+    voronoi.features.forEach((feat, i) => {
+        if (feat) {
+            const pt = active[i];
+            const areaSqMeters = turf.area(feat);
+            const areaHectares = areaSqMeters / 10000;
+            feat.properties = {
+                name: pt.displayName,
+                areaM2: areaSqMeters,
+                areaHa: areaHectares
+            };
+        }
+    });
+
+    const layer = L.geoJSON(voronoi, {
+        style: { color: '#0ea5e9', weight: 1.5, fillColor: '#0ea5e9', fillOpacity: 0.15, opacity: 0.8 },
+        pane: 'analysisPane',
+        onEachFeature: function (feature, layer) {
+            if (feature.properties && feature.properties.name) {
+                const popupContent = `<div class="popup-wrap" style="min-width:180px; padding:8px;">
+                            <div class="popup-name-display" style="font-size:13px; margin-bottom:8px;">${escapeHTML(feature.properties.name)}</div>
+                            <div style="display:flex; flex-direction:column; gap:6px; padding:8px; background:var(--surface-2); border-radius:var(--radius-sm); border:1px solid var(--border);">
+                                <div style="display:flex; justify-content:space-between; font-size:12px; align-items:center;">
+                                    <span style="color:var(--text-secondary); font-weight:500;"><i class="fas fa-draw-polygon" style="margin-right:4px;color:#0ea5e9"></i>Luas Area</span>
+                                    <span style="color:#0ea5e9; font-weight:700;">${feature.properties.areaHa.toLocaleString('id-ID', { maximumFractionDigits: 2 })} ha</span>
+                                </div>
+                                <div style="display:flex; justify-content:space-between; font-size:11px; align-items:center; border-top:1px dashed var(--border); padding-top:6px;">
+                                    <span style="color:var(--text-muted);">Meter Persegi</span>
+                                    <span style="color:var(--text-primary); font-family:monospace;">${feature.properties.areaM2.toLocaleString('id-ID', { maximumFractionDigits: 0 })} m²</span>
+                                </div>
+                            </div>
+                        </div>`;
+                layer.bindPopup(popupContent, { maxWidth: 250, className: '', closeButton: true });
             }
         }
+    }).addTo(map);
+    analysisLayers.push(layer);
+    currentAnalysisResults = { type: 'voronoi', n: active.length, polygonCount: voronoi.features.filter(f => f).length };
+    showAnalysisResults('voronoi', currentAnalysisResults);
+}
 
+// ── Bounding Box Area ───────────────────────────────────────
+function calculateBoundingBoxArea(data) {
+    const d = data || currentData;
+    if (!d.length) return 1;
+    let minLat = d[0].lat, maxLat = d[0].lat, minLng = d[0].lng, maxLng = d[0].lng;
+    d.forEach(p => { if (p.lat < minLat) minLat = p.lat; if (p.lat > maxLat) maxLat = p.lat; if (p.lng < minLng) minLng = p.lng; if (p.lng > maxLng) maxLng = p.lng; });
+    const ld = (maxLat - minLat) * 111320, lgd = (maxLng - minLng) * 111320 * Math.cos((minLat + maxLat) / 2 * Math.PI / 180);
+    return Math.max(ld * lgd, 1000000);
+}
 
+// ── Tampilkan hasil ──────────────────────────────────────────
+function showAnalysisResults(type, data) {
+    const bottomPanel = document.getElementById('bottomPanel'), results = document.getElementById('analysisResults');
+    let html = '';
+    if (type === 'distance') {
+        html = `<div class="results-grid"><div class="stat-card"><div class="stat-label">Total Jarak</div><div class="stat-value">${data.total.toFixed(2)} m</div></div><div class="stat-card"><div class="stat-label">Jumlah Segmen</div><div class="stat-value">${data.segments}</div></div></div>`;
+    } else if (type === 'buffer') {
+        html = `<div class="results-grid"><div class="stat-card"><div class="stat-label">Radius</div><div class="stat-value">${data.radius} m</div></div><div class="stat-card"><div class="stat-label">Titik Terdeteksi</div><div class="stat-value">${data.count}</div></div></div>`;
+    } else if (type === 'nearest') {
+        html = `<div class="results-grid"><div class="stat-card"><div class="stat-label">R-Ratio</div><div class="stat-value">${data.rRatio.toFixed(3)}</div></div><div class="stat-card"><div class="stat-label">Z-Score</div><div class="stat-value">${data.zScore.toFixed(3)}</div></div></div><div class="interp-card"><div class="interp-label">Interpretasi:</div><div class="interp-value">${data.interpretation}</div></div>`;
+    } else if (type === 'moran') {
+        html = `<div class="results-grid"><div class="stat-card"><div class="stat-label">Moran Index</div><div class="stat-value">${data.moranI.toFixed(4)}</div></div><div class="stat-card"><div class="stat-label">Z-Score</div><div class="stat-value">${data.zScore.toFixed(3)}</div></div></div><div class="interp-card"><div class="interp-label">Pola:</div><div class="interp-value">${data.pola}</div></div>`;
+    } else if (type === 'ripley') {
+        html = `<div class="results-grid"><div class="stat-card"><div class="stat-label">Jarak Max</div><div class="stat-value">${data.maxDist.toFixed(0)} m</div></div><div class="stat-card"><div class="stat-label">L(d) Avg</div><div class="stat-value">${data.avgL.toFixed(2)}</div></div></div>`;
+    } else if (type === 'kde') {
+        const hp = ((data.hotCells / data.totalCells) * 100).toFixed(1);
+        const z = data.zones || { sangatTinggi: [], tinggi: [], sedang: [], rendah: [], sangatRendah: [] };
+        const zoneRow = (label, color, icon, arr) => {
+            if (!arr.length) return `<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border)"><div style="width:10px;height:10px;border-radius:50%;background:${color};flex-shrink:0"></div><span style="font-size:11px;font-weight:600;min-width:90px">${label}</span><span style="font-size:10px;color:var(--text-muted);font-style:italic">— tidak ada titik</span></div>`;
+            const names = arr.slice(0, 5).map(n => escapeHTML(n)).join(', ') + (arr.length > 5 ? ` <span style="color:var(--text-muted)">(+${arr.length - 5} lainnya)</span>` : '');
+            return `<div style="display:flex;align-items:flex-start;gap:6px;padding:5px 0;border-bottom:1px solid var(--border)"><div style="width:10px;height:10px;border-radius:50%;background:${color};flex-shrink:0;margin-top:2px"></div><div><div style="font-size:11px;font-weight:600">${label} <span style="font-weight:400;color:var(--text-muted)">(${arr.length} titik)</span></div><div style="font-size:10px;color:var(--text-secondary);margin-top:1px">${names}</div></div></div>`;
+        };
+        html = `<div class="stats-grid"><div class="stat-card"><div class="stat-value">${data.n}</div><div class="stat-label">Total Titik</div></div><div class="stat-card"><div class="stat-value">${(data.bandwidth / 1000).toFixed(1)}km</div><div class="stat-label">Bandwidth</div></div><div class="stat-card"><div class="stat-value">${hp}%</div><div class="stat-label">Sel Hotspot ≥70%</div></div><div class="stat-card"><div class="stat-value">${data.resolution}×${data.resolution}</div><div class="stat-label">Resolusi Grid</div></div></div>`;
+        html += `<div class="interp-card"><div class="interp-title"><i class="fas fa-fire-alt" style="color:#e11d48;margin-right:4px"></i>Distribusi Area Densitas</div><div style="margin-top:4px">${zoneRow('Sangat Tinggi (≥80%)', '#7f1d1d', 'fire', z.sangatTinggi)}${zoneRow('Tinggi (60–80%)', '#dc2626', 'arrow-up', z.tinggi)}${zoneRow('Sedang (40–60%)', '#fb923c', 'equals', z.sedang)}${zoneRow('Rendah (20–40%)', '#fde047', 'arrow-down', z.rendah)}${zoneRow('Sangat Rendah (<20%)', '#bbf7d0', 'leaf', z.sangatRendah)}</div></div>`;
+        html += `<div class="interp-card" style="margin-top:6px"><div class="interp-title">Statistik KDE</div><div class="interp-row"><strong>Resolusi:</strong> ${data.resolution}×${data.resolution} · Epanechnikov kernel</div><div class="interp-row" style="color:#e11d48;font-weight:500;margin-top:3px">Area merah = konsentrasi tertinggi</div></div><div class="methodology-callout"><i class="fas fa-info-circle"></i> <strong>Catatan metodologis:</strong> Bandwidth dipilih manual. Gunakan <em>Least Squares Cross-Validation (LSCV)</em> atau <em>Sheather-Jones plug-in</em> untuk pemilihan otomatis (Bowman, 1984; Sheather & Jones, 1991).</div><div class="credit-badge"><i class="fas fa-book"></i> <a href="https://doi.org/10.1002/9780470316849" target="_blank" rel="noopener">Silverman (1986)</a> · Sheather & Jones (1991) bw selector · Davies & Hazelton (2010) adaptive KDE</div>`;
+    } else if (type === 'gi') {
+        let thHtml = '', tcHtml = '';
+        data.topHot.forEach(r => { thHtml += `<div class="ripley-row" style="display:flex"><strong style="flex:1">${escapeHTML(r.displayName)}</strong><span style="color:#dc2626">z=${r.zScore.toFixed(2)}</span></div>`; });
+        data.topCold.forEach(r => { tcHtml += `<div class="ripley-row" style="display:flex"><strong style="flex:1">${escapeHTML(r.displayName)}</strong><span style="color:#2563eb">z=${r.zScore.toFixed(2)}</span></div>`; });
+        html = `<div class="stats-grid"><div class="stat-card"><div class="stat-value" style="color:#dc2626">${data.hot95}</div><div class="stat-label">Hotspot 95%</div></div><div class="stat-card"><div class="stat-value" style="color:#2563eb">${data.cold95}</div><div class="stat-label">Coldspot 95%</div></div><div class="stat-card"><div class="stat-value">${data.ns}</div><div class="stat-label">Tidak Signifikan</div></div><div class="stat-card"><div class="stat-value">${data.n}</div><div class="stat-label">Total</div></div></div><div class="interp-card"><div class="interp-title">Atribut: ${escapeHTML(data.attrKey === '_lat' ? 'Latitude' : data.attrKey)} · Threshold: ${data.threshold}m</div></div>`;
+        if (data.topHot.length) html += `<div style="margin-top:6px"><div class="interp-title" style="color:#dc2626;margin-bottom:3px">Top Hotspot</div>${thHtml}</div>`;
+        if (data.topCold.length) html += `<div style="margin-top:6px"><div class="interp-title" style="color:#2563eb;margin-bottom:3px">Top Coldspot</div>${tcHtml}</div>`;
+        html += `<div class="methodology-callout"><i class="fas fa-info-circle"></i> <strong>Catatan metodologis:</strong> Tidak ada koreksi <em>multiple testing</em>. Gunakan FDR (Benjamini-Hochberg) untuk mengurangi false positives pada dataset besar.</div><div class="credit-badge"><i class="fas fa-book"></i> <a href="https://doi.org/10.1111/j.1538-4632.1992.tb00261.x" target="_blank" rel="noopener">Getis & Ord (1992)</a> · <a href="https://doi.org/10.1111/j.1538-4632.1995.tb00912.x" target="_blank" rel="noopener">Ord & Getis (1995)</a></div>`;
+    } else if (type === 'sde') {
+        html = `<div class="stats-grid"><div class="stat-card"><div class="stat-value">${data.n}</div><div class="stat-label">Total Titik</div></div><div class="stat-card"><div class="stat-value">${(data.area / 1000000).toFixed(2)}</div><div class="stat-label">Luas (km²)</div></div><div class="stat-card"><div class="stat-value">${data.rotation.toFixed(1)}°</div><div class="stat-label">Sudut Rotasi</div></div><div class="stat-card"><div class="stat-value">${(data.semiMajor / data.semiMinor).toFixed(2)}</div><div class="stat-label">Rasio Elips</div></div></div><div class="interp-card"><div class="interp-title">Standard Deviational Ellipse <span style="font-size:9px;color:#059669">(proyeksi Mercator)</span></div><div class="interp-row"><strong>Mean Center:</strong> ${data.center[1].toFixed(5)}, ${data.center[0].toFixed(5)}</div><div class="interp-row"><strong>Sumbu Mayor:</strong> ${data.semiMajor.toFixed(0)}m</div><div class="interp-row"><strong>Sumbu Minor:</strong> ${data.semiMinor.toFixed(0)}m</div></div><div class="credit-badge"><i class="fas fa-book"></i> Lefever (1926) · Yuill (1971) · Wang et al. (2015) confidence SDE</div>`;
+    } else if (type === 'voronoi') {
+        html = `<div class="stats-grid"><div class="stat-card"><div class="stat-value">${data.n}</div><div class="stat-label">Titik Input</div></div><div class="stat-card"><div class="stat-value">${data.polygonCount}</div><div class="stat-label">Poligon Terbentuk</div></div></div><div class="interp-card"><div class="interp-title">Thiessen Polygons</div><div class="interp-row">Menunjukkan area pengaruh masing-masing titik berdasarkan jarak terdekat (Euclidean).</div></div><div class="credit-badge"><i class="fas fa-book"></i> Voronoi (1908) · Thiessen (1911) · Okabe et al. (2000)</div>`;
+    }
+    results.innerHTML = html;
+    bottomPanel.classList.remove('panel-hidden');
+}
 
-        // Global function for buffer point zoom
-        window.zoomToBufferPoint = function(lat, lng) {
-            const point = currentData.find(p => 
-                Math.abs(p.lat - parseFloat(lat)) < 0.0001 && 
-                Math.abs(p.lng - parseFloat(lng)) < 0.0001
-            );
-            if (point) {
-                zoomToPoint(point);
-            }
+function clearAnalysisResults() {
+    document.getElementById('bottomPanel').classList.add('panel-hidden');
+    document.getElementById('analysisResults').innerHTML = '';
+}
+
+function refreshAnalysis() {
+    analysisMode = null; bufferPoint = null; currentAnalysisResults = null; kdeGridData = null;
+    document.querySelectorAll('.analysis-btn').forEach(b => b.classList.remove('active'));
+    ['bufferControls', 'kdeControls', 'giControls', 'moranControls', 'distanceControls'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+    });
+    clearDistanceLines(); stopKDEAnimation();
+    analysisLayers.forEach(l => { try { if (l && l.remove) l.remove(); else if (map.hasLayer(l)) map.removeLayer(l); } catch (e) { } }); analysisLayers = [];
+    if (kdeLegend) { kdeLegend.remove(); kdeLegend = null; } if (giLegend) { giLegend.remove(); giLegend = null; }
+    // Hormati kategorisasi yang ada
+    if (currentLayer) {
+        if (kategoriState.active) {
+            kategoriState.markerMap.forEach(({ marker, kategori }) => {
+                if (kategoriState.hiddenCats.has(kategori)) {
+                    marker.setStyle({ fillOpacity: 0, opacity: 0, interactive: false });
+                } else {
+                    const color = kategoriState.colorMap[kategori] || '#94a3b8';
+                    marker.setStyle({ fillColor: color, color: darkenColor(color), fillOpacity: 0.88, opacity: 1, interactive: true });
+                }
+            });
+        } else {
+            currentLayer.eachLayer(l => { if (l.setStyle) l.setStyle({ fillColor: '#4f46e5', color: '#3730a3', fillOpacity: 0.85, opacity: 1 }); });
         }
+    }
+    clearAnalysisResults(); showSuccess('Analisis berhasil direset.');
+}
+
+// ── Ekspor Hasil ─────────────────────────────────────────────
+function exportAnalysisResults() {
+    if (!currentAnalysisResults) { showError('Tidak ada hasil analisis untuk diekspor!'); return; }
+    const resultsHtml = document.getElementById('analysisResults').innerHTML;
+    const typeLabel = currentAnalysisResults.type.toUpperCase();
+    const date = new Date().toLocaleString('id-ID');
+    const reportHtml = `<!DOCTYPE html><html lang="id"><head><meta charset="UTF-8"><title>Laporan PointGIS - ${typeLabel}</title><link rel="stylesheet" href="css/style.css"></head><body><div class="report-container"><div class="header"><div><h1 style="font-size:24px">PointGIS v2.1 — Laporan Analisis</h1><p style="color:#64748b;font-size:12px">Dicetak: ${date}</p></div></div><div style="background:#f1f5f9;padding:25px;border-radius:12px;margin-bottom:30px">${resultsHtml}</div><div style="text-align:center;font-size:12px;color:#94a3b8">© ${new Date().getFullYear()} PointGIS — Advanced Point Pattern Analysis</div></div></body></html>`;
+    const win = window.open('', '_blank');
+    win.document.write(reportHtml);
+    win.document.close();
+    showSuccess('Laporan siap dicetak!');
+}
+
+// ── File handling ───────────────────────────────────────────
+function handleFile(file) {
+    const n = file.name.toLowerCase();
+    if (!['.kml', '.kmz', '.xlsx', '.xls'].some(e => n.endsWith(e))) { showError('Format tidak didukung.'); return; }
+    showLoading(true);
+    if (n.endsWith('.kmz')) handleKMZ(file);
+    else if (n.endsWith('.xlsx') || n.endsWith('.xls')) handleExcel(file);
+    else { const r = new FileReader(); r.onload = e => { try { parseKML(e.target.result); } catch (err) { showError('Error KML: ' + err.message); showLoading(false); } }; r.readAsText(file); }
+}
+
+function handleKMZ(file) {
+    const r = new FileReader();
+    r.onload = e => JSZip.loadAsync(e.target.result).then(zip => {
+        let kf = null;
+        Object.keys(zip.files).forEach(fn => { if (fn.toLowerCase().endsWith('.kml')) kf = zip.files[fn]; });
+        if (kf) kf.async('text').then(t => { try { parseKML(t, zip); } catch (err) { showError('Error KMZ: ' + err.message); showLoading(false); } });
+        else { showError('Tidak ada KML dalam KMZ'); showLoading(false); }
+    }).catch(err => { showError('Error baca KMZ: ' + err.message); showLoading(false); });
+    r.readAsArrayBuffer(file);
+}
+
+function handleExcel(file) {
+    const r = new FileReader();
+    r.onload = e => { try { const wb = XLSX.read(e.target.result, { type: 'array' }); parseExcelData(XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]])); } catch (err) { showError('Error Excel: ' + err.message); showLoading(false); } };
+    r.readAsArrayBuffer(file);
+}
+
+function parseExcelData(data) {
+    if (!data.length) { showError('File Excel kosong'); showLoading(false); return; }
+    currentData = []; const allAttrs = new Set();
+    if (currentLayer) map.removeLayer(currentLayer);
+    currentLayer = L.layerGroup().addTo(map);
+    const cols = Object.keys(data[0]);
+    let latCol = null, lngCol = null;
+    cols.forEach(c => { const cl = c.toLowerCase(); if (!latCol && (cl.includes('lat') || cl === 'y')) latCol = c; if (!lngCol && (cl.includes('lng') || cl.includes('lon') || cl === 'x')) lngCol = c; });
+    if (!latCol || !lngCol) { showError('Kolom lat/lng tidak ditemukan'); showLoading(false); return; }
+    data.forEach((row, idx) => {
+        const lat = parseFloat(row[latCol]), lng = parseFloat(row[lngCol]);
+        if (!isNaN(lat) && !isNaN(lng)) {
+            const attrs = {};
+            Object.keys(row).forEach(k => { if (row[k] != null && row[k] !== '') { attrs[k] = row[k].toString(); allAttrs.add(k); } });
+            const name = getBestName(attrs, `#${idx + 1}`);
+            const pd = { lat, lng, attributes: attrs, displayName: name };
+            currentData.push(pd); addMarker(lat, lng, pd, null);
+        }
+    });
+    finalizeLoad(allAttrs, 'Excel', currentData.length);
+}
+
+function parseKML(kmlText, zipFile = null) {
+    const doc = new DOMParser().parseFromString(kmlText, 'text/xml');
+    const pms = doc.getElementsByTagName('Placemark');
+    if (!pms.length) { showError('Tidak ada titik dalam KML'); showLoading(false); return; }
+    currentData = []; const allAttrs = new Set();
+    if (currentLayer) map.removeLayer(currentLayer);
+    currentLayer = L.layerGroup().addTo(map);
+    for (let i = 0; i < pms.length; i++) {
+        const pm = pms[i], coordEl = pm.getElementsByTagName('coordinates')[0];
+        if (!coordEl) continue;
+        const [lng, lat] = coordEl.textContent.trim().split(',').map(Number);
+        if (isNaN(lat) || isNaN(lng)) continue;
+        const attrs = {};
+        const nameEl = pm.getElementsByTagName('name')[0], descEl = pm.getElementsByTagName('description')[0];
+        if (nameEl) { attrs['Name'] = nameEl.textContent; allAttrs.add('Name'); }
+        if (descEl) { attrs['Description'] = descEl.textContent; allAttrs.add('Description'); }
+        const extData = pm.getElementsByTagName('ExtendedData')[0];
+        if (extData) { const sds = extData.getElementsByTagName('SimpleData'); for (let j = 0; j < sds.length; j++) { attrs[sds[j].getAttribute('name')] = sds[j].textContent; allAttrs.add(sds[j].getAttribute('name')); } }
+        const name = getBestName(attrs, `#${i + 1}`);
+        const pd = { lat, lng, attributes: attrs, displayName: name };
+        currentData.push(pd); addMarker(lat, lng, pd, zipFile);
+    }
+    finalizeLoad(allAttrs, 'KML', currentData.length);
+}
+
+function addMarker(lat, lng, pointData, zipFile) {
+    const m = L.circle([lat, lng], { radius: 10, fillColor: '#00ffff', color: '#ffffff', weight: 1.5, opacity: 0.9, fillOpacity: 0.7, className: 'glowing-point' });
+    m.pointData = pointData;
+    m.on('click', () => handleMarkerClick(m, pointData, zipFile));
+    currentLayer.addLayer(m);
+}
+
+function finalizeLoad(allAttrs, type, count) {
+    if (!count) { showError('Tidak ada titik valid'); showLoading(false); return; }
+    const g = new L.featureGroup(currentLayer.getLayers());
+    map.fitBounds(g.getBounds().pad(0.12));
+    selectedAttributes = new Set(allAttrs);
+    document.getElementById('attributesSection').style.display = 'block';
+    createDashboardChart();
+    enableAnalysisButtons();
+    populateKategoriSelect();
+    showSuccess(`${count} titik berhasil dimuat dari file ${type}.`);
+    showLoading(false);
+}
+
+function createDashboardChart() {
+    const ctx = document.getElementById('attributeChart').getContext('2d');
+    if (attributeChart) attributeChart.destroy();
+    attributeChart = new Chart(ctx, {
+        type: 'doughnut',
+        data: { labels: ['Total Titik', 'Atribut Aktif'], datasets: [{ data: [currentData.length, selectedAttributes.size], backgroundColor: ['#4f46e5', '#7c3aed'], borderWidth: 0 }] },
+        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right', labels: { font: { family: 'Inter', size: 10 }, padding: 8, usePointStyle: true } } }, layout: { padding: 4 } }
+    });
+    createDataList();
+}
+
+function createDataList() {
+    const list = document.getElementById('dataList'); list.innerHTML = '';
+    currentData.forEach((pt, idx) => {
+        const item = document.createElement('div'); item.className = 'data-item'; item.onclick = () => zoomToPoint(pt);
+        item.innerHTML = `<div class="data-item-name">${escapeHTML(pt.displayName)}</div><div class="data-item-coords">${pt.lat.toFixed(4)}, ${pt.lng.toFixed(4)}</div>`;
+        list.appendChild(item);
+    });
+}
+
+// ── Marker click — popup selalu aktif ──────────────────────
+function handleMarkerClick(marker, pointData, zipFile = null) {
+    if (analysisMode === 'distance') addDistancePoint(marker, pointData);
+    if (analysisMode === 'buffer') selectBufferPoint(marker, pointData);
+    openCompactPopup(marker, pointData, zipFile);
+}
+
+function openCompactPopup(marker, pointData, zipFile = null) {
+    const pid = 'p' + Date.now();
+    let attrsHtml = '';
+    Object.keys(pointData.attributes).forEach(attr => {
+        const val = pointData.attributes[attr];
+        if (val == null || val === '') return;
+        const isUrl = /^https?:\/\/.+/.test(val);
+        attrsHtml += `<div class="popup-attr-row">
+            <span class="popup-attr-key">${escapeHTML(attr)}</span>
+            <span class="popup-attr-val">${isUrl ? `<a href="${escapeHTML(val)}" target="_blank" rel="noopener" style="color:#4f46e5">${escapeHTML(val.length > 28 ? val.substring(0, 28) + '…' : val)} <i class="fas fa-external-link-alt" style="font-size:8px"></i></a>` : escapeHTML(val)}</span>
+        </div>`;
+        if (zipFile && /\.(jpg|jpeg|png|gif)$/i.test(val)) {
+            const iid = 'img_' + pid + '_' + attr.replace(/\s+/g, '');
+            attrsHtml += `<img id="${iid}" style="max-width:100%;max-height:200px;border-radius:5px;display:none;margin-top:3px" alt="${escapeHTML(attr)}"/>`;
+            zipFile.files[val]?.async('base64').then(b64 => { const el = document.getElementById(iid); if (el) { el.src = `data:image/jpeg;base64,${b64}`; el.style.display = 'block'; } });
+        }
+    });
+
+    const html = `<div class="popup-wrap">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px">
+            <div class="popup-name-display" style="flex:1;margin:0;font-size:12px">${escapeHTML(pointData.displayName)}</div>
+            <button class="popup-close-btn" onclick="window.closeCurrentPopup()" style="margin-left:5px" aria-label="Tutup popup">×</button>
+        </div>
+        <div class="popup-coords" style="margin-bottom:5px">
+            <div><span class="popup-coord-label">Lat</span><br><span class="popup-coord-val">${pointData.lat.toFixed(5)}</span></div>
+            <div><span class="popup-coord-label">Lng</span><br><span class="popup-coord-val">${pointData.lng.toFixed(5)}</span></div>
+        </div>
+        <div class="popup-attrs" style="max-height:160px">${attrsHtml}</div>
+        <div class="popup-actions">
+            <button class="popup-action-btn" style="background:#4f46e5;color:#fff" onclick="window.zoomToCoords(${pointData.lat},${pointData.lng})"><i class="fas fa-crosshairs"></i> Zoom</button>
+            <button class="popup-action-btn" style="background:#059669;color:#fff" onclick="window.copyCoordinates(${pointData.lat},${pointData.lng})"><i class="fas fa-copy"></i> Copy</button>
+        </div>
+    </div>`;
+    const popup = L.popup({ maxWidth: 240, className: '', closeButton: false, autoClose: true, closeOnClick: true }).setContent(html);
+    marker.bindPopup(popup).openPopup();
+}
+
+window.closeCurrentPopup = () => map.closePopup();
+window.copyCoordinates = function (lat, lng) {
+    const text = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+    if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => showSuccess('Koordinat disalin: ' + text)).catch(() => fallbackCopy(text));
+    else fallbackCopy(text);
+};
+function fallbackCopy(text) {
+    const ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;left:-9999px';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); showSuccess('Koordinat disalin: ' + text); } catch { showError('Gagal menyalin koordinat'); }
+    document.body.removeChild(ta);
+}
+
+function zoomToPoint(pt) {
+    map.setView([pt.lat, pt.lng], 18);
+    currentLayer.eachLayer(l => {
+        if (l.pointData === pt || (l.getLatLng && Math.abs(l.getLatLng().lat - pt.lat) < 0.0001 && Math.abs(l.getLatLng().lng - pt.lng) < 0.0001)) {
+            const orig = { fillColor: l.options.fillColor, color: l.options.color };
+            l.setStyle({ fillColor: '#dc2626', color: '#b91c1c' });
+            setTimeout(() => { if (l.setStyle) l.setStyle(orig); }, 2500);
+            setTimeout(() => l.fire('click'), 220);
+        }
+    });
+}
+window.zoomToPoint = zoomToPoint;
+window.zoomToCoords = function (lat, lng) {
+    const pt = currentData.find(p => Math.abs(p.lat - lat) < 0.0001 && Math.abs(p.lng - lng) < 0.0001);
+    if (pt) zoomToPoint(pt); else map.setView([lat, lng], 18);
+};
+
+// ── Enable buttons ──────────────────────────────────────────
+function enableAnalysisButtons() {
+    ['distanceBtn', 'bufferBtn', 'nearestBtn', 'moranBtn', 'ripleyBtn', 'kdeBtn', 'giBtn', 'sdeBtn', 'voronoiBtn', 'refreshBtn'].forEach(id => document.getElementById(id).disabled = false);
+}
+
+// ── KATEGORISASI ────────────────────────────────────────────
+function populateKategoriSelect() {
+    const sel = document.getElementById('kategoriSelect');
+    sel.innerHTML = '<option value="">— Pilih kolom —</option>';
+    if (!currentData.length) return;
+    Array.from(selectedAttributes).forEach(k => {
+        const vals = [...new Set(currentData.map(p => p.attributes[k]).filter(Boolean))];
+        if (vals.length >= 2 && vals.length <= 25) {
+            const opt = document.createElement('option');
+            opt.value = k; opt.textContent = `${k}  (${vals.length})`;
+            sel.appendChild(opt);
+        }
+    });
+}
+
+function applyKategorisasi() {
+    const kolom = document.getElementById('kategoriSelect').value;
+    if (!kolom) { showError('Pilih kolom kategori terlebih dahulu!'); return; }
+    const uniqueVals = [...new Set(currentData.map(p => p.attributes[kolom]).filter(Boolean))].sort();
+    if (uniqueVals.length > 25) { showError(`Kolom "${kolom}" punya ${uniqueVals.length} nilai unik — maks 25.`); return; }
+    const colorMap = {};
+    uniqueVals.forEach((v, i) => { colorMap[v] = KATEGORI_PALETTE[i % KATEGORI_PALETTE.length]; });
+    kategoriState = { active: true, kolom, colorMap, hiddenCats: new Set(), markerMap: [] };
+    currentLayer.eachLayer(layer => {
+        if (!layer.setStyle || !layer.pointData) return;
+        const pt = layer.pointData;
+        const val = pt.attributes[kolom] || '__nocat__';
+        const color = colorMap[val] || '#94a3b8';
+        layer.setStyle({ fillColor: color, color: darkenColor(color), fillOpacity: 0.88, opacity: 1, interactive: true });
+        kategoriState.markerMap.push({ marker: layer, kategori: val, pt });
+    });
+    renderKategoriLegend(uniqueVals, colorMap, kolom);
+    document.getElementById('resetKategoriBtn').disabled = false;
+    updateDashboardAfterFilter();
+    showSuccess(`"${kolom}" — ${uniqueVals.length} kategori aktif.`);
+}
+
+function renderKategoriLegend(vals, colorMap, kolom) {
+    const leg = document.getElementById('kategoriLegend');
+    const counts = {};
+    currentData.forEach(p => { const v = p.attributes[kolom]; if (v) counts[v] = (counts[v] || 0) + 1; });
+    leg.style.display = 'block';
+    leg.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
+        <div class="kategori-legend-title" style="margin:0">${escapeHTML(kolom)}</div>
+        <div style="display:flex;gap:3px">
+            <button onclick="window.setAllKategori(true)" style="font-size:9px;padding:1px 5px;border:1px solid var(--border);border-radius:3px;background:var(--surface-2);cursor:pointer;color:var(--text-secondary)" aria-label="Tampilkan semua">Semua</button>
+            <button onclick="window.setAllKategori(false)" style="font-size:9px;padding:1px 5px;border:1px solid var(--border);border-radius:3px;background:var(--surface-2);cursor:pointer;color:var(--text-secondary)" aria-label="Sembunyikan semua">Hapus</button>
+        </div>
+    </div>`;
+    vals.forEach(val => {
+        const color = colorMap[val], cnt = counts[val] || 0, isHidden = kategoriState.hiddenCats.has(val);
+        const item = document.createElement('div');
+        item.className = 'kategori-legend-item' + (isHidden ? ' faded' : '');
+        item.dataset.val = val;
+        item.innerHTML = `<div class="kategori-swatch" style="background:${isHidden ? 'transparent' : color};border-color:${color}"></div>
+            <span class="kategori-label">${escapeHTML(val)}</span><span class="kategori-count">${cnt}</span>`;
+        item.addEventListener('click', () => toggleKategoriVisibility(val));
+        leg.appendChild(item);
+    });
+    const activeN = getActiveData().length;
+    leg.innerHTML += `<div id="kategoriActiveInfo" style="font-size:10px;color:var(--text-muted);margin-top:5px;padding-top:4px;border-top:1px solid var(--border)">${activeN} dari ${currentData.length} titik aktif</div>`;
+}
+
+function toggleKategoriVisibility(val) {
+    const { hiddenCats, markerMap, colorMap } = kategoriState;
+    if (hiddenCats.has(val)) hiddenCats.delete(val); else hiddenCats.add(val);
+    _applyMarkerVisibility(markerMap, hiddenCats, colorMap);
+    document.querySelectorAll('.kategori-legend-item').forEach(el => {
+        const h = hiddenCats.has(el.dataset.val);
+        el.classList.toggle('faded', h);
+        const sw = el.querySelector('.kategori-swatch');
+        if (sw) sw.style.background = h ? 'transparent' : (colorMap[el.dataset.val] || '#94a3b8');
+    });
+    const info = document.getElementById('kategoriActiveInfo');
+    if (info) info.textContent = `${getActiveData().length} dari ${currentData.length} titik aktif`;
+    updateDashboardAfterFilter();
+}
+
+window.setAllKategori = function (show) {
+    const { colorMap, markerMap } = kategoriState;
+    if (show) kategoriState.hiddenCats.clear();
+    else Object.keys(colorMap).forEach(v => kategoriState.hiddenCats.add(v));
+    _applyMarkerVisibility(markerMap, kategoriState.hiddenCats, colorMap);
+    renderKategoriLegend(Object.keys(colorMap).sort(), colorMap, kategoriState.kolom);
+    updateDashboardAfterFilter();
+};
+
+function _applyMarkerVisibility(markerMap, hiddenCats, colorMap) {
+    markerMap.forEach(({ marker, kategori }) => {
+        if (!marker.setStyle) return;
+        if (hiddenCats.has(kategori)) {
+            marker.setStyle({ fillOpacity: 0, opacity: 0, interactive: false });
+            const el = marker.getElement && marker.getElement();
+            if (el) el.style.pointerEvents = 'none';
+        } else {
+            const color = colorMap[kategori] || '#94a3b8';
+            marker.setStyle({ fillColor: color, color: darkenColor(color), fillOpacity: 0.88, opacity: 1, interactive: true });
+            const el = marker.getElement && marker.getElement();
+            if (el) el.style.pointerEvents = '';
+        }
+    });
+}
+
+function updateDashboardAfterFilter() {
+    const active = getActiveData().length, total = currentData.length;
+    if (attributeChart) {
+        attributeChart.data.datasets[0].data = [active, total - active];
+        attributeChart.data.labels = [`Aktif (${active})`, `Hidden (${total - active})`];
+        attributeChart.data.datasets[0].backgroundColor = ['#4f46e5', '#e2e8f0'];
+        attributeChart.update();
+    }
+    const badge = document.getElementById('activeDataBadge');
+    const count = document.getElementById('activeDataCount');
+    if (badge && count) {
+        if (active < total) {
+            badge.style.display = 'inline-flex';
+            badge.style.alignItems = 'center';
+            badge.style.gap = '3px';
+            count.textContent = active;
+            badge.style.background = active === 0 ? '#fee2e2' : 'var(--surface-3)';
+            badge.style.color = active === 0 ? '#dc2626' : 'var(--text-secondary)';
+        } else {
+            badge.style.display = 'none';
+        }
+    }
+}
+
+function resetKategorisasi() {
+    currentLayer.eachLayer(layer => {
+        if (layer.setStyle) layer.setStyle({ fillColor: '#4f46e5', color: '#3730a3', fillOpacity: 0.85, opacity: 1, interactive: true });
+        const el = layer.getElement && layer.getElement();
+        if (el) el.style.pointerEvents = '';
+    });
+    kategoriState = { active: false, kolom: null, colorMap: {}, hiddenCats: new Set(), markerMap: [] };
+    const leg = document.getElementById('kategoriLegend');
+    leg.style.display = 'none'; leg.innerHTML = '';
+    document.getElementById('kategoriSelect').value = '';
+    document.getElementById('resetKategoriBtn').disabled = true;
+    if (attributeChart) {
+        attributeChart.data.datasets[0].data = [currentData.length, selectedAttributes.size];
+        attributeChart.data.labels = ['Total Titik', 'Atribut Aktif'];
+        attributeChart.data.datasets[0].backgroundColor = ['#4f46e5', '#7c3aed'];
+        attributeChart.update();
+    }
+    showSuccess('Kategorisasi direset — semua titik aktif.');
+}
+
+function darkenColor(hex) {
+    if (!hex || hex[0] !== '#') return hex;
+    const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    return `rgb(${Math.floor(r * 0.72)},${Math.floor(g * 0.72)},${Math.floor(b * 0.72)})`;
+}
+
+// ── Utilitas ─────────────────────────────────────────────────
+function showLoading(show) { document.getElementById('loading').style.display = show ? 'flex' : 'none'; }
+function showSuccess(msg) { const el = document.getElementById('successMessage'); el.style.display = 'flex'; document.getElementById('successText').textContent = msg; setTimeout(() => el.style.display = 'none', 4000); }
+function showError(msg) { const el = document.getElementById('errorMessage'); el.style.display = 'flex'; document.getElementById('errorText').textContent = msg; setTimeout(() => el.style.display = 'none', 4000); }
