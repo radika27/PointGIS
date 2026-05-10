@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="id">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PointGIS v2.1 — Analisis Spasial Data Titik</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+
+<body>
+    <div class="app-shell">
+
+        <!-- ============ PANEL KIRI ============ -->
+        <aside class="panel panel-left" id="leftPanel">
+            <div class="panel-brand">
+                <div class="brand-icon">
+                    <img src="PointGis.png" alt="PointGIS Logo" style="width:100%;height:100%;object-fit:contain;">
+                </div>
+                <div class="brand-text">
+                    <h1 class="brand-title">PointGIS</h1>
+                    <p class="brand-sub">Analisis Spasial Data Titik</p>
+                </div>
+            </div>
+            <div class="brand-credit">
+                <a href="https://www.linkedin.com/in/radhyka-galih-pranata-b78249209" target="_blank" rel="noopener">
+                    <i class="fab fa-linkedin brand-credit-icon"></i>
+                    Radhyka Galih Pranata
+                </a>
+            </div>
+            <div class="divider"></div>
+
+            <!-- Upload -->
+            <div class="section-label"><i class="fas fa-upload"></i> Upload Data</div>
+            <div id="successMessage" class="alert alert-success" style="display:none;">
+                <i class="fas fa-check-circle"></i> <span id="successText"></span>
+            </div>
+            <div id="errorMessage" class="alert alert-error" style="display:none;">
+                <i class="fas fa-exclamation-circle"></i> <span id="errorText"></span>
+            </div>
+            <div class="upload-zone" id="uploadArea">
+                <div class="upload-zone-icon"><i class="fas fa-cloud-upload-alt"></i></div>
+                <p class="upload-zone-text">Klik atau drag & drop</p>
+                <p class="upload-zone-sub">KML · KMZ · XLSX · XLS</p>
+                <input type="file" id="fileInput" class="file-input" accept=".kml,.kmz,.xlsx,.xls" />
+            </div>
+            <div class="progress-bar-wrap" id="progressBarWrap">
+                <div class="progress-bar-fill" id="progressBarFill"></div>
+            </div>
+            <div class="loading-bar" id="loading" style="display:none;">
+                <div class="loading-spinner"></div>
+                <span>Memproses file...</span>
+            </div>
+
+            <!-- Dashboard & atribut -->
+            <div id="attributesSection" style="display:none;">
+                <div class="divider"></div>
+                <div class="section-label"><i class="fas fa-chart-pie"></i> Data Dashboard</div>
+                <div class="chart-wrap">
+                    <canvas id="attributeChart"></canvas>
+                </div>
+                <div id="dataList" class="data-list"></div>
+                <div class="divider"></div>
+
+                <!-- Kategorisasi -->
+                <div class="section-label"><i class="fas fa-layer-group"></i> Kategorisasi Titik</div>
+                <div class="kategori-panel" id="kategoriPanel">
+                    <div class="slider-row">
+                        <label>Kolom kategori:</label>
+                        <select id="kategoriSelect"
+                            style="width:100%;padding:4px 6px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:11px;margin-top:3px;background:var(--surface);">
+                            <option value="">— Pilih kolom —</option>
+                        </select>
+                    </div>
+                    <button class="apply-btn" id="applyKategoriBtn" style="margin-top:6px">
+                        <i class="fas fa-palette"></i> Terapkan Warna
+                    </button>
+                    <button class="apply-btn" id="resetKategoriBtn"
+                        style="margin-top:5px;background:var(--surface-3);color:var(--text-secondary);border:1px solid var(--border);"
+                        disabled>
+                        <i class="fas fa-times"></i> Reset Warna
+                    </button>
+                    <div id="kategoriLegend" style="display:none;margin-top:8px;"></div>
+                </div>
+
+            </div>
+        </aside>
+
+        <!-- Toggle kiri -->
+        <button class="panel-toggle toggle-left" id="leftToggle" title="Sembunyikan panel kiri"
+            aria-label="Toggle panel kiri">
+            <i class="fas fa-chevron-left"></i>
+        </button>
+
+        <!-- ============ PETA ============ -->
+        <main class="map-wrap">
+            <div id="map"></div>
+        </main>
+
+        <!-- Toggle kanan -->
+        <button class="panel-toggle toggle-right" id="rightToggle" title="Sembunyikan panel kanan"
+            aria-label="Toggle panel kanan">
+            <i class="fas fa-chevron-right"></i>
+        </button>
+
+        <!-- ============ PANEL KANAN ============ -->
+        <aside class="panel panel-right" id="rightPanel">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <div class="section-label" style="margin:0"><i class="fas fa-flask"></i> Analisis Geospasial</div>
+                <div id="activeDataBadge"
+                    style="display:none;font-size:10px;background:var(--surface-3);border:1px solid var(--border);border-radius:10px;padding:2px 7px;color:var(--text-secondary)">
+                    <span id="activeDataCount">0</span> titik aktif
+                </div>
+            </div>
+
+            <!-- Grup dasar -->
+            <div class="btn-group-label">Dasar</div>
+            <button class="analysis-btn" id="distanceBtn" disabled aria-label="Analisis jarak multi-titik">
+                <span class="btn-icon"><i class="fas fa-ruler-combined"></i></span>
+                <span class="btn-label">Analisis Jarak</span>
+            </button>
+            <div class="buffer-controls" id="distanceControls" style="display:none;">
+                <p id="distanceStatus"
+                    style="font-size:11px;color:var(--text-secondary);margin-bottom:8px;line-height:1.4">Klik
+                    titik-titik di peta untuk membuat jalur</p>
+                <div style="display:flex;gap:6px;">
+                    <button class="apply-btn" id="undoDistanceBtn" disabled style="flex:1;background:#f59e0b;">
+                        <i class="fas fa-undo"></i> Undo
+                    </button>
+                    <button class="apply-btn" id="finishDistanceBtn" disabled style="flex:2;">
+                        <i class="fas fa-check"></i> Selesai
+                    </button>
+                </div>
+            </div>
+            <button class="analysis-btn" id="bufferBtn" disabled aria-label="Buffer analysis">
+                <span class="btn-icon"><i class="fas fa-draw-polygon"></i></span>
+                <span class="btn-label">Buffer Analysis</span>
+            </button>
+            <div class="buffer-controls" id="bufferControls" style="display:none;">
+                <div class="slider-row">
+                    <label>Radius: <strong><span id="radiusValue">1000</span> m</strong></label>
+                    <input type="range" id="radiusSlider" min="100" max="5000" value="1000" step="100"
+                        aria-label="Radius buffer">
+                </div>
+                <button class="apply-btn" id="applyBufferBtn">
+                    <i class="fas fa-play"></i> Terapkan Buffer
+                </button>
+            </div>
+            <button class="analysis-btn" id="nearestBtn" disabled aria-label="Nearest neighbor analysis">
+                <span class="btn-icon"><i class="fas fa-project-diagram"></i></span>
+                <span class="btn-label">Nearest Neighbor</span>
+            </button>
+
+            <!-- Grup lanjutan -->
+            <div class="btn-group-label" style="margin-top:1rem;">Lanjutan</div>
+            <button class="analysis-btn" id="moranBtn" disabled aria-label="Moran's I analysis">
+                <span class="btn-icon"><i class="fas fa-wave-square"></i></span>
+                <span class="btn-label">Moran's I Index</span>
+            </button>
+            <div class="buffer-controls" id="moranControls" style="display:none;">
+                <div class="slider-row">
+                    <label>Atribut analisis:</label>
+                    <select id="moranAttrSelect"
+                        style="width:100%;padding:4px 6px;border:1px solid #e2e8f0;border-radius:6px;font-size:11px;margin-top:2px;"
+                        aria-label="Atribut Moran">
+                        <option value="_lat">Latitude (default)</option>
+                    </select>
+                </div>
+                <button class="apply-btn" id="applyMoranBtn" style="background:var(--accent);">
+                    <i class="fas fa-play"></i> Jalankan Moran's I
+                </button>
+            </div>
+
+            <!-- SDE & Voronoi -->
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+                <button class="analysis-btn" id="sdeBtn" disabled style="margin-bottom:0"
+                    aria-label="Standard Deviational Ellipse">
+                    <span class="btn-icon"><i class="fas fa-ellipsis-h"></i></span>
+                    <span class="btn-label">SDE</span>
+                </button>
+                <button class="analysis-btn" id="voronoiBtn" disabled style="margin-bottom:0"
+                    aria-label="Voronoi polygons">
+                    <span class="btn-icon"><i class="fas fa-th-large"></i></span>
+                    <span class="btn-label">Voronoi</span>
+                </button>
+            </div>
+            <button class="analysis-btn" id="ripleyBtn" disabled aria-label="Ripley's K function">
+                <span class="btn-icon"><i class="fas fa-bullseye"></i></span>
+                <span class="btn-label">Ripley's K-Function</span>
+            </button>
+
+            <!-- KDE Hotspot -->
+            <button class="analysis-btn btn-kde" id="kdeBtn" disabled aria-label="KDE Hotspot">
+                <span class="btn-icon"><i class="fas fa-fire-alt"></i></span>
+                <span class="btn-label">KDE Hotspot</span>
+                <span class="badge-new">NEW</span>
+            </button>
+            <div class="buffer-controls" id="kdeControls" style="display:none;">
+                <div class="slider-row">
+                    <label>Bandwidth: <strong><span id="kdeBandwidthValue">1000</span> m</strong></label>
+                    <input type="range" id="kdeBandwidthSlider" min="200" max="5000" value="1000" step="100"
+                        aria-label="Bandwidth KDE">
+                </div>
+                <div class="slider-row">
+                    <label>Resolusi grid: <strong><span id="kdeResValue">40</span></strong></label>
+                    <input type="range" id="kdeResSlider" min="20" max="80" value="40" step="10"
+                        aria-label="Resolusi KDE">
+                </div>
+                <div class="slider-row">
+                    <label>Animasi: <strong><span id="kdeAnimLabel">Aktif</span></strong></label>
+                    <input type="range" id="kdeAnimSlider" min="0" max="1" value="1" step="1" aria-label="Animasi KDE">
+                </div>
+                <button class="apply-btn" id="applyKdeBtn">
+                    <i class="fas fa-fire"></i> Jalankan KDE
+                </button>
+            </div>
+
+            <!-- Getis-Ord Gi* -->
+            <button class="analysis-btn btn-gi" id="giBtn" disabled aria-label="Getis-Ord Gi*">
+                <span class="btn-icon"><i class="fas fa-map-marked-alt"></i></span>
+                <span class="btn-label">Getis-Ord Gi*</span>
+                <span class="badge-new">NEW</span>
+            </button>
+            <div class="buffer-controls" id="giControls" style="display:none;">
+                <div class="slider-row">
+                    <label>Threshold jarak: <strong><span id="giThreshValue">1000</span> m</strong></label>
+                    <input type="range" id="giThreshSlider" min="200" max="10000" value="1000" step="100"
+                        aria-label="Threshold Gi*">
+                </div>
+                <div class="slider-row">
+                    <label>Atribut analisis:</label>
+                    <select id="giAttrSelect"
+                        style="width:100%;padding:4px 6px;border:1px solid #e2e8f0;border-radius:6px;font-size:11px;margin-top:2px;"
+                        aria-label="Atribut Gi*">
+                        <option value="_lat">Latitude (default)</option>
+                    </select>
+                </div>
+                <button class="apply-btn btn-gi-apply" id="applyGiBtn">
+                    <i class="fas fa-map-marked-alt"></i> Jalankan Gi*
+                </button>
+            </div>
+
+            <!-- Progress bar analisis -->
+            <div class="progress-bar-wrap" id="analysisProgressWrap">
+                <div class="progress-bar-fill" id="analysisProgressFill"></div>
+            </div>
+
+            <!-- Reset -->
+            <button class="reset-btn" id="refreshBtn" disabled aria-label="Reset analisis">
+                <i class="fas fa-undo-alt"></i> Reset Analisis
+            </button>
+        </aside>
+
+        <!-- ============ PANEL BAWAH (HASIL) ============ -->
+        <div class="panel-bottom panel-hidden" id="bottomPanel">
+            <div class="panel-bottom-header">
+                <div class="panel-bottom-title"><i class="fas fa-chart-bar" style="color:var(--accent)"></i> Hasil
+                    Analisis Geospasial</div>
+                <div style="display:flex;gap:10px;align-items:center;">
+                    <button id="exportResultsBtn" title="Ekspor Laporan"
+                        style="background:var(--accent);color:white;border:none;padding:5px 12px;border-radius:6px;font-size:11px;cursor:pointer;font-weight:600;display:flex;align-items:center;gap:6px">
+                        <i class="fas fa-download"></i> Ekspor Laporan
+                    </button>
+                    <button class="panel-bottom-close" id="closeBottomPanel" title="Tutup">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+            </div>
+            <div class="panel-bottom-content" id="analysisResults">
+                <!-- Konten hasil dimasukkan ke sini -->
+            </div>
+        </div>
+
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+    <script src="js/main.js"></script>
+</body>
+
+</html>
